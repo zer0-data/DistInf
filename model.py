@@ -21,6 +21,7 @@ import torch.distributed as dist
 from transformers import AutoTokenizer,LlamaForCausalLM  
 from transformers.cache_utils import DynamicCache # New Import
 import warnings
+from sklearn.cluster import KMeans
 
 warnings.filterwarnings("ignore", category=UserWarning, message=".*where dtype is torch.float16.*")
 
@@ -91,7 +92,8 @@ class CustomAccuracyModel:
     decoding loop to guarantee correct execution.
     """
 
-    def __init__(self, path: str, max_new_tokens: int, block_size: int, k_summary_size: int, stop_words: Optional[List[str]] = None):
+    def __init__(self, path: str, max_new_tokens: int, block_size: int, k_summary_size: int, 
+                 stop_words: Optional[List[str]] = None, summary_method: str = 'top_k'):
         if not torch.cuda.is_available():
             raise RuntimeError("This implementation requires a CUDA-enabled GPU.")
         
@@ -115,8 +117,56 @@ class CustomAccuracyModel:
         self.block_size = block_size
         self.k = k_summary_size
         self.summary_chunk_size = 512
+        self.summary_method = summary_method
         print(f"[SETUP] Using summary_chunk_size of {self.summary_chunk_size} to manage memory.")
+        print(f"[SETUP] Using summary method: {summary_method}")
         print("[SETUP] Initialization complete.")
+
+    def _get_kmeans_summary(self, model_eager, input_ids: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            chunks = list(input_ids.split(self.summary_chunk_size, dim=1))
+            all_hidden_states = []
+            
+            # Get hidden states for each chunk
+            for chunk in chunks:
+                outputs = model_eager(chunk, output_hidden_states=True)
+                # Use the last hidden state as token representations
+                hidden_states = outputs.hidden_states[-1].squeeze(0)
+                all_hidden_states.append(hidden_states)
+                del outputs
+                torch.cuda.empty_cache()
+            
+            # Combine hidden states
+            combined_states = torch.cat(all_hidden_states, dim=0)
+            
+            # Convert to numpy for sklearn
+            features = combined_states.cpu().numpy()
+            
+            # Apply k-means clustering
+            n_clusters = min(self.k, features.shape[0])
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42)
+            clusters = kmeans.fit_predict(features)
+            
+            # Find tokens closest to centroids
+            centroids = kmeans.cluster_centers_
+            selected_indices = []
+            
+            for i in range(n_clusters):
+                cluster_points = features[clusters == i]
+                if len(cluster_points) > 0:
+                    # Find the point closest to the centroid
+                    centroid = centroids[i]
+                    distances = np.linalg.norm(cluster_points - centroid, axis=1)
+                    closest_point_idx = np.argmin(distances)
+                    # Get global index
+                    global_idx = np.where(clusters == i)[0][closest_point_idx]
+                    selected_indices.append(global_idx)
+            
+            # Sort indices to maintain sequence order
+            selected_indices.sort()
+            summary_ids = input_ids[:, selected_indices]
+            
+            return summary_ids
 
     def _get_top_k_summary(self, model_eager, input_ids: torch.Tensor) -> torch.Tensor:
         with torch.no_grad():
@@ -136,6 +186,12 @@ class CustomAccuracyModel:
             summary_ids = input_ids[:, top_k_indices_sorted]
         return summary_ids
 
+    def _get_summary(self, model_eager, input_ids: torch.Tensor) -> torch.Tensor:
+        if self.summary_method == 'kmeans':
+            return self._get_kmeans_summary(model_eager, input_ids)
+        else:  # default to top_k
+            return self._get_top_k_summary(model_eager, input_ids)
+
     def _get_output_text(self, full_output_ids: torch.Tensor, num_input_tokens: int) -> str:
         generated_ids = full_output_ids[0, num_input_tokens:]
         generated_text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
@@ -154,7 +210,7 @@ class CustomAccuracyModel:
             model_eager = LlamaForCausalLM.from_pretrained(
                 self.model_path, torch_dtype=torch.bfloat16, device_map='auto', attn_implementation='eager'
             ).eval()
-            summaries = [self._get_top_k_summary(model_eager, block) for block in context_blocks]
+            summaries = [self._get_summary(model_eager, block) for block in context_blocks]
             del model_eager
             torch.cuda.empty_cache()
             print("--- [Pass 1] All summaries generated. ---")

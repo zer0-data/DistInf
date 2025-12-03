@@ -1,6 +1,6 @@
-# tidal_attention.py
-# Consolidated module for Tidal/LIM attention with top-K token sampling
-# This replaces the src/ folder and its submodules
+# topk_attention.py
+# Consolidated module for Top-K attention with block-wise token selection
+# Accumulates attention scores across all layers and selects top-K tokens
 
 import math
 import time
@@ -139,16 +139,16 @@ _global_accumulator: Optional[AttentionScoreAccumulator] = None
 
 def get_or_create_accumulator(model) -> AttentionScoreAccumulator:
     """Get or create an attention score accumulator for a model."""
-    if not hasattr(model, '_tidal_accumulator'):
-        model._tidal_accumulator = AttentionScoreAccumulator()
-    return model._tidal_accumulator
+    if not hasattr(model, '_topk_accumulator'):
+        model._topk_accumulator = AttentionScoreAccumulator()
+    return model._topk_accumulator
 
 
 # =============================================================================
-# TIDAL ATTENTION FORWARD FUNCTION
+# TOP-K ATTENTION FORWARD FUNCTION
 # =============================================================================
 
-def llama_tidal_attention_forward(
+def llama_topk_attention_forward(
     self,
     hidden_states: torch.Tensor,
     position_embeddings: Tuple[torch.Tensor, torch.Tensor],
@@ -189,7 +189,7 @@ def llama_tidal_attention_forward(
     hidden_shape = (*input_shape, -1, self.head_dim)
     
     # Get accumulator and config from kwargs
-    accumulator: Optional[AttentionScoreAccumulator] = kwargs.get("_tidal_accumulator", None)
+    accumulator: Optional[AttentionScoreAccumulator] = kwargs.get("_topk_accumulator", None)
     num_layers: int = kwargs.get("_num_layers", 32)  # Default for Llama
     final_selection_layer: int = kwargs.get("_final_selection_layer", num_layers - 1)
     
@@ -430,13 +430,13 @@ def llama_tidal_attention_forward(
 
 
 # =============================================================================
-# ENABLE TIDAL ATTENTION ON LLAMA MODELS
+# ENABLE TOP-K ATTENTION ON LLAMA MODELS
 # =============================================================================
 
-def enable_llama_tidal_attention(
+def enable_llama_topk_attention(
     model,
     top_k,
-    attn_type="tidal",
+    attn_type="topk",
     sparse_layer_start=2,
     correction_layer=9,
     attn_sink=0,
@@ -446,12 +446,12 @@ def enable_llama_tidal_attention(
     **kwargs,
 ):
     """
-    Patches all LlamaAttention modules in the model to use Tidal attention.
+    Patches all LlamaAttention modules in the model to use Top-K attention.
     
     Args:
         model: The model to patch
         top_k: Number of tokens to select in sparse attention
-        attn_type: Type of attention ("tidal" or "lim")
+        attn_type: Type of attention ("topk")
         sparse_layer_start: First layer to apply sparse attention
         correction_layer: Layer at which to re-select tokens during decoding
         attn_sink: Number of initial tokens to always attend to
@@ -472,7 +472,7 @@ def enable_llama_tidal_attention(
         # Store the original forward method
         module.original_forward = module.forward
 
-        def new_tidal_forward(
+        def new_topk_forward(
             hidden_states,
             position_embeddings,
             attention_mask=None,
@@ -481,12 +481,12 @@ def enable_llama_tidal_attention(
             **fwd_kwargs: Unpack[FlashAttentionKwargs],
         ):
             # Pass accumulator, config, and root model via kwargs
-            fwd_kwargs['_tidal_accumulator'] = accumulator
+            fwd_kwargs['_topk_accumulator'] = accumulator
             fwd_kwargs['_num_layers'] = num_layers
             fwd_kwargs['_final_selection_layer'] = final_selection_layer
             fwd_kwargs['_root_model'] = _root_model
             
-            return llama_tidal_attention_forward(
+            return llama_topk_attention_forward(
                 module,
                 hidden_states,
                 position_embeddings,
@@ -501,12 +501,12 @@ def enable_llama_tidal_attention(
                 **fwd_kwargs,
             )
 
-        if attn_type == "lim" or attn_type == "tidal":
-            module.forward = new_tidal_forward
+        if attn_type in ("topk", "lim", "tidal"):
+            module.forward = new_topk_forward
 
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
-            enable_llama_tidal_attention(
+            enable_llama_topk_attention(
                 module,
                 top_k,
                 attn_type,
@@ -521,7 +521,7 @@ def enable_llama_tidal_attention(
 
         # Check if this module is a LlamaAttention module
         if "LlamaAttention" in module.__class__.__name__:
-            print(f"Applying Tidal/LIM patch to layer {module.layer_idx}: {name}")
+            print(f"Applying Top-K attention patch to layer {module.layer_idx}: {name}")
             print(f"  - top_k: {top_k}")
             print(f"  - sparse_layer_start (for decoding): {sparse_layer_start}")
             print(f"  - correction_layer (for decoding): {correction_layer}")
@@ -530,12 +530,12 @@ def enable_llama_tidal_attention(
 
 
 # =============================================================================
-# MAIN ENABLE TIDAL FUNCTION
+# MAIN ENABLE TOP-K ATTENTION FUNCTION
 # =============================================================================
 
-def enable_tidal(
+def enable_topk_attention(
     model,
-    attn_type="tidal",
+    attn_type="topk",
     top_k=256,
     sparse_layer_start=2,
     correction_layer=13,
@@ -544,11 +544,11 @@ def enable_tidal(
     **kwargs,
 ):
     """
-    Enable Tidal/LIM attention on a model.
+    Enable Top-K attention on a model.
     
     Args:
         model: The model to patch
-        attn_type: Type of attention ("tidal" or "lim")
+        attn_type: Type of attention ("topk")
         top_k: Number of tokens to select in sparse attention
         sparse_layer_start: First layer to apply sparse attention
         correction_layer: Layer at which to re-select tokens during decoding
@@ -556,8 +556,8 @@ def enable_tidal(
         lim_ratio: Ratio for local/global attention split
         **kwargs: Additional arguments
     """
-    if attn_type == "lim" or attn_type == "tidal":
-        print(f"Tidal/LIM Enabled: attention_sink: {attention_sink}")
+    if attn_type in ("topk", "lim", "tidal"):
+        print(f"Top-K Attention Enabled: attention_sink: {attention_sink}")
         print(f"token budget: {top_k}")
         print(f"sparse layer starts from: Layer {sparse_layer_start}")
         print(f"reselection layer: {correction_layer}")
@@ -573,7 +573,7 @@ def enable_tidal(
             # Create the accumulator for this model
             accumulator = get_or_create_accumulator(model)
             
-            enable_llama_tidal_attention(
+            enable_llama_topk_attention(
                 model,
                 top_k,
                 attn_type,
@@ -586,7 +586,7 @@ def enable_tidal(
                 **kwargs,
             )
         else:
-            print(f"Warning: Model type '{model_type}' is not supported for Tidal attention.")
+            print(f"Warning: Model type '{model_type}' is not supported for Top-K attention.")
     return
 
 
@@ -600,12 +600,12 @@ def start_block_accumulation(model, position_ids: torch.Tensor):
     Call this before processing each block.
     
     Args:
-        model: The model with Tidal attention enabled
+        model: The model with Top-K attention enabled
         position_ids: Position IDs for the current block
     """
     accumulator = get_or_create_accumulator(model)
     accumulator.start_block(position_ids)
-    print(f"[Tidal] Started block accumulation for positions {position_ids[0, 0].item()} to {position_ids[0, -1].item()}")
+    print(f"[Top-K] Started block accumulation for positions {position_ids[0, 0].item()} to {position_ids[0, -1].item()}")
 
 
 def get_block_selected_tokens(model) -> Tuple[List[int], List[int]]:
@@ -614,7 +614,7 @@ def get_block_selected_tokens(model) -> Tuple[List[int], List[int]]:
     The accumulator automatically performs selection at the final layer.
     
     Args:
-        model: The model with Tidal attention enabled
+        model: The model with Top-K attention enabled
         
     Returns:
         Tuple of (selected_indices, selected_position_ids)
@@ -636,7 +636,7 @@ def finish_block_accumulation(model):
     Note: This is typically called automatically at the final layer.
     
     Args:
-        model: The model with Tidal attention enabled
+        model: The model with Top-K attention enabled
     """
     accumulator = get_or_create_accumulator(model)
     accumulator.finish_block()
@@ -646,14 +646,14 @@ def finish_block_accumulation(model):
 # HISTORY TRACKING MIXIN FOR TOP-K TOKEN SELECTION
 # =============================================================================
 
-class TidalHistoryMixin:
+class TopKHistoryMixin:
     """
     Mixin class that provides history tracking methods for top-K token selection.
     These methods can be added to any model to track which tokens were selected
     during prefill/decoding.
     """
     
-    def init_tidal_history(self):
+    def init_topk_history(self):
         """Initialize the history tracking attributes."""
         self.global_top_tokens_history = {}
         self.current_sequence_id = None
@@ -860,11 +860,11 @@ class TidalHistoryMixin:
 # UTILITY FUNCTION TO ADD HISTORY TRACKING TO ANY MODEL
 # =============================================================================
 
-def add_tidal_history_tracking(model):
+def add_topk_history_tracking(model):
     """
-    Add Tidal history tracking methods to a model instance.
+    Add Top-K history tracking methods to a model instance.
     
-    This function dynamically adds the methods from TidalHistoryMixin to a model
+    This function dynamically adds the methods from TopKHistoryMixin to a model
     instance, allowing it to track top-K token selections during prefill/decoding.
     
     Args:
@@ -873,7 +873,7 @@ def add_tidal_history_tracking(model):
     Returns:
         The model with history tracking methods added
     """
-    mixin = TidalHistoryMixin()
+    mixin = TopKHistoryMixin()
     
     # Initialize history attributes on the model
     model.global_top_tokens_history = {}
@@ -894,9 +894,9 @@ def add_tidal_history_tracking(model):
     return model
 
 
-def add_tidal_history_tracking_to_inner_model(model):
+def add_topk_history_tracking_to_inner_model(model):
     """
-    Add Tidal history tracking to the inner model (model.model) as well.
+    Add Top-K history tracking to the inner model (model.model) as well.
     This is needed for models that wrap another model internally.
     
     Args:
@@ -906,27 +906,27 @@ def add_tidal_history_tracking_to_inner_model(model):
         The model with history tracking added to both outer and inner models
     """
     # Add to outer model
-    add_tidal_history_tracking(model)
+    add_topk_history_tracking(model)
     
     # Add to inner model if it exists
     if hasattr(model, 'model'):
-        add_tidal_history_tracking(model.model)
+        add_topk_history_tracking(model.model)
     
     return model
 
 
 # =============================================================================
-# LOAD FUNCTION FOR TIDAL-ENABLED MODELS
+# LOAD FUNCTION FOR TOP-K ENABLED MODELS
 # =============================================================================
 
-def load_tidal_model(model_name_or_path, attn_type, **kwargs):
+def load_topk_model(model_name_or_path, attn_type, **kwargs):
     """
-    Load a model with Tidal/LIM attention enabled.
+    Load a model with Top-K attention enabled.
     
     Args:
         model_name_or_path: Path to the model or model name
-        attn_type: Type of attention ("tidal", "lim", or other for standard)
-        **kwargs: Additional arguments including top_k, selection_layers, etc.
+        attn_type: Type of attention ("topk", "tidal", "lim", or other for standard)
+        **kwargs: Additional arguments including top_k, etc.
     
     Returns:
         tuple: (model, tokenizer)
@@ -934,8 +934,8 @@ def load_tidal_model(model_name_or_path, attn_type, **kwargs):
     print(f"Loading model from {model_name_or_path} ...")
     print(f"attn_type: {attn_type}")
 
-    if attn_type == "tidal" or attn_type == "lim":
-        print("sparse attention (tidal or lim) enabled!")
+    if attn_type in ("topk", "tidal", "lim"):
+        print("Top-K sparse attention enabled!")
         from transformers import AutoTokenizer, AutoModelForCausalLM
 
         tokenizer = AutoTokenizer.from_pretrained(
@@ -952,10 +952,10 @@ def load_tidal_model(model_name_or_path, attn_type, **kwargs):
         )
 
         # Add history tracking
-        add_tidal_history_tracking_to_inner_model(model)
+        add_topk_history_tracking_to_inner_model(model)
         
-        # Enable tidal attention
-        enable_tidal(model, attn_type, **kwargs)
+        # Enable Top-K attention
+        enable_topk_attention(model, attn_type, **kwargs)
     else:
         # flash attention / standard
         from transformers import AutoTokenizer, AutoModelForCausalLM

@@ -32,34 +32,34 @@ except ImportError:
     KMeans = None
     SKLEARN_AVAILABLE = False
 
-# --- IMPORTS for Tidal-Prefill (from consolidated tidal_attention module) ---
+# --- IMPORTS for Top-K Attention (from consolidated topk_attention module) ---
 try:
-    from tidal_attention import (
-        enable_tidal,
-        load_tidal_model,
-        add_tidal_history_tracking,
-        add_tidal_history_tracking_to_inner_model,
-        TidalHistoryMixin,
-        # New imports for block-wise accumulation
+    from topk_attention import (
+        enable_topk_attention,
+        load_topk_model,
+        add_topk_history_tracking,
+        add_topk_history_tracking_to_inner_model,
+        TopKHistoryMixin,
+        # Imports for block-wise accumulation
         start_block_accumulation,
         finish_block_accumulation,
         get_or_create_accumulator,
         AttentionScoreAccumulator,
     )
-    TIDAL_AVAILABLE = True
+    TOPK_AVAILABLE = True
 except ImportError:
-    print("Warning: Could not import tidal_attention module.")
-    print("Please ensure 'tidal_attention.py' is in your project root.")
-    enable_tidal = None
-    load_tidal_model = None
-    add_tidal_history_tracking = None
-    add_tidal_history_tracking_to_inner_model = None
-    TidalHistoryMixin = None
+    print("Warning: Could not import topk_attention module.")
+    print("Please ensure 'topk_attention.py' is in your project root.")
+    enable_topk_attention = None
+    load_topk_model = None
+    add_topk_history_tracking = None
+    add_topk_history_tracking_to_inner_model = None
+    TopKHistoryMixin = None
     start_block_accumulation = None
     finish_block_accumulation = None
     get_or_create_accumulator = None
     AttentionScoreAccumulator = None
-    TIDAL_AVAILABLE = False
+    TOPK_AVAILABLE = False
 
 # --- ORIGINAL IMPORT for RingAttentionModel ---
 # This is the LlamaForCausalLM from the Star Attention repo
@@ -229,7 +229,7 @@ class DistributedInferenceBaseModel:
 class StarAttentionModel(DistributedInferenceBaseModel):
     """
     MODIFIED Star Attention
-    Implements sequential Tidal-Prefill (Phase 1)
+    Implements sequential Top-K Prefill (Phase 1)
     and distributed Star-Attention generation (Phase 2).
     
     This class inherits from DistributedInferenceBaseModel to get:
@@ -243,7 +243,7 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         path: str,
         max_new_tokens: int,
         stop_words: Optional[List[str]] = None,
-        # New args for Tidal-Prefill
+        # Args for Top-K Prefill
         top_k: int = 256,
         selection_layers: List[int] = [2, 14],
         num_blocks: int = 4,
@@ -282,17 +282,17 @@ class StarAttentionModel(DistributedInferenceBaseModel):
             attn_implementation='flash_attention_2',
         )
 
-        # 5. NOW, patch this model with the Tidal logic
-        if not TIDAL_AVAILABLE or enable_tidal is None:
+        # 5. NOW, patch this model with the Top-K attention logic
+        if not TOPK_AVAILABLE or enable_topk_attention is None:
             raise ImportError(
-                "Could not import from 'tidal_attention' module."
-                " Please ensure 'tidal_attention.py' is in your project root."
+                "Could not import from 'topk_attention' module."
+                " Please ensure 'topk_attention.py' is in your project root."
             )
 
-        print("Applying Tidal patches to StarLlama model...")
-        enable_tidal(
+        print("Applying Top-K attention patches to StarLlama model...")
+        enable_topk_attention(
             self.model,
-            attn_type="tidal",
+            attn_type="topk",
             top_k=self.top_k,
             selection_layers=self.selection_layers,
             sparse_layer_start=min(self.selection_layers) if self.selection_layers else 0,
@@ -300,12 +300,12 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         )
         
         # 6. Add history tracking methods to the model
-        #    The patching in enable_tidal *replaces* the model's forward
+        #    The patching in enable_topk_attention *replaces* the model's forward
         #    but the model object itself is still a StarLlamaForCausalLM.
         #    We add history tracking methods using the utility function.
         if not hasattr(self.model, "set_tokenizer_for_decode"):
             print("Adding history-tracking methods to model...")
-            add_tidal_history_tracking_to_inner_model(self.model)
+            add_topk_history_tracking_to_inner_model(self.model)
 
         self.model.set_tokenizer_for_decode(self.tokenizer)
 
@@ -350,7 +350,7 @@ class StarAttentionModel(DistributedInferenceBaseModel):
     # ... (inside StarAttentionModel class)
 
     @torch.no_grad()
-    def _perform_sequential_tidal_prefill(
+    def _perform_sequential_topk_prefill(
         self,
         ctx_id_blocks: List[torch.Tensor],
         pos_id_blocks: List[torch.Tensor],
@@ -366,7 +366,7 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         
         This function is run *only* on rank 0.
         """
-        print(f"[Rank 0] Starting Sequential Tidal Prefill for {self.num_blocks} blocks.")
+        print(f"[Rank 0] Starting Sequential Top-K Prefill for {self.num_blocks} blocks.")
         print(f"[Rank 0] Using block-wise attention accumulation across all layers.")
         
         # Get the accumulator for this model
@@ -517,7 +517,7 @@ class StarAttentionModel(DistributedInferenceBaseModel):
 
     def __call__(self, prompt_context: str, prompt_query: str) -> Dict[str, List[str]]:
         
-        # --- PHASE 1: Sequential Tidal Prefill ---
+        # --- PHASE 1: Sequential Top-K Prefill ---
         # Only Rank 0 does the sequential prefill
         
         # 1. Tokenize and partition context
@@ -527,7 +527,7 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         
         final_sparse_cache = None
         if self.rank == 0:
-            final_sparse_cache = self._perform_sequential_tidal_prefill(
+            final_sparse_cache = self._perform_sequential_topk_prefill(
                 ctx_id_blocks, pos_id_blocks
             )
         

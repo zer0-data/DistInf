@@ -83,6 +83,22 @@ The Top-K attention mechanism works as follows:
 
 This approach provides better token selection compared to layer-specific methods by considering the full attention pattern across the model.
 
+## Project Structure
+
+```
+DistInf/
+├── model.py                    # Main model classes (StarAttentionModel, etc.)
+├── topk_attention.py           # Top-K attention implementation
+├── run_topk_single_sample.py   # Single sample test (distributed)
+├── run_star_attention_inference.py  # Full benchmark inference
+├── run_single_sample.py        # Single GPU custom accuracy model
+├── requirements.txt
+└── star_attention/             # Star Attention distributed components
+    ├── modeling_llama.py
+    ├── modeling_flash_attention_utils.py
+    └── star_flash_attn/
+```
+
 ## Installation
 
 ```bash

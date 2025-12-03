@@ -32,23 +32,34 @@ except ImportError:
     KMeans = None
     SKLEARN_AVAILABLE = False
 
-# --- NEW IMPORTS for Tidal-Prefill ---
-# We import our custom 'load' function from the src package
-# This load function will return the modified LlamaForCausalLM
-# that is capable of sampling tokens during prefill.
+# --- IMPORTS for Tidal-Prefill (from consolidated tidal_attention module) ---
 try:
-    from src.utils import load as load_tidal_model
-    from src.models.llama_tidaldecoding import LlamaForCausalLM as TidalLlamaForCausalLM
+    from tidal_attention import (
+        enable_tidal,
+        load_tidal_model,
+        add_tidal_history_tracking,
+        add_tidal_history_tracking_to_inner_model,
+        TidalHistoryMixin,
+        # New imports for block-wise accumulation
+        start_block_accumulation,
+        finish_block_accumulation,
+        get_or_create_accumulator,
+        AttentionScoreAccumulator,
+    )
+    TIDAL_AVAILABLE = True
 except ImportError:
-    print("Warning: Could not import tidal model components from 'src' package.")
-    print("Please ensure 'src' is in your PYTHONPATH and contains:")
-    print("- utils.py")
-    print("- enable_tidal.py")
-    print("- models/llama_tidaldecoding.py")
-    print("- tidal_build/modify_llama_lim.py")
-    # Define a placeholder if imports fail to avoid crashing
+    print("Warning: Could not import tidal_attention module.")
+    print("Please ensure 'tidal_attention.py' is in your project root.")
+    enable_tidal = None
     load_tidal_model = None
-    TidalLlamaForCausalLM = None
+    add_tidal_history_tracking = None
+    add_tidal_history_tracking_to_inner_model = None
+    TidalHistoryMixin = None
+    start_block_accumulation = None
+    finish_block_accumulation = None
+    get_or_create_accumulator = None
+    AttentionScoreAccumulator = None
+    TIDAL_AVAILABLE = False
 
 # --- ORIGINAL IMPORT for RingAttentionModel ---
 # This is the LlamaForCausalLM from the Star Attention repo
@@ -272,16 +283,10 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         )
 
         # 5. NOW, patch this model with the Tidal logic
-        try:
-            # Assuming 'model.py' is in the root, and 'src' is a folder
-            from src.enable_tidal import enable_tidal
-            # We also need the LlamaForCausalLM from src to check
-            # if the 'set_tokenizer_for_decode' method exists.
-            from src.models.llama_tidaldecoding import LlamaForCausalLM as TidalLlama
-        except ImportError:
+        if not TIDAL_AVAILABLE or enable_tidal is None:
             raise ImportError(
-                "Could not import from 'src' package."
-                " Please ensure 'src' is in your PYTHONPATH."
+                "Could not import from 'tidal_attention' module."
+                " Please ensure 'tidal_attention.py' is in your project root."
             )
 
         print("Applying Tidal patches to StarLlama model...")
@@ -294,26 +299,13 @@ class StarAttentionModel(DistributedInferenceBaseModel):
             correction_layer=max(self.selection_layers) if self.selection_layers else 0,
         )
         
-        # 6. Set tokenizer for history tracking
+        # 6. Add history tracking methods to the model
         #    The patching in enable_tidal *replaces* the model's forward
         #    but the model object itself is still a StarLlamaForCausalLM.
-        #    We need to check if *that* model has the history-tracking methods
-        #    from `llama_tidaldecoding.py`.
-        #    Since it *doesn't*, we must add them.
-        #    Let's borrow the methods from the TidalLlama class.
+        #    We add history tracking methods using the utility function.
         if not hasattr(self.model, "set_tokenizer_for_decode"):
-            print("Manually adding history-tracking methods to model...")
-            self.model.set_tokenizer_for_decode = TidalLlama.set_tokenizer_for_decode.__get__(self.model)
-            self.model.model.set_sequence_context = TidalLlama.model.set_sequence_context.__get__(self.model.model)
-            self.model.model.get_top_tokens_history = TidalLlama.model.get_top_tokens_history.__get__(self.model.model)
-            self.model.model.clear_top_tokens_history = TidalLlama.model.clear_top_tokens_history.__get__(self.model.model)
-            self.model.model._generate_sequence_id = TidalLlama.model._generate_sequence_id.__get__(self.model.model)
-            
-            # Init the history dict on the inner model
-            self.model.model.global_top_tokens_history = {}
-            self.model.model.current_sequence_id = None
-            self.model.model.current_input_text = None
-            self.model.model._tokenizer_for_decode = None
+            print("Adding history-tracking methods to model...")
+            add_tidal_history_tracking_to_inner_model(self.model)
 
         self.model.set_tokenizer_for_decode(self.tokenizer)
 
@@ -364,51 +356,49 @@ class StarAttentionModel(DistributedInferenceBaseModel):
         pos_id_blocks: List[torch.Tensor],
     ) -> List[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Runs the new sequential prefill logic.
-        Processes context block-by-block, sampling tokens at selection layers,
-        and building a new sparse KV cache (anchor cache) from the union of
-        all sampled tokens.
+        Runs the new sequential prefill logic with block-wise attention accumulation.
+        
+        For each block:
+        1. Start accumulation for the block
+        2. Run forward pass - attention scores are accumulated across ALL layers
+        3. At the final layer, top-K selection is performed based on summed scores
+        4. The accumulator is automatically cleaned up after each block
         
         This function is run *only* on rank 0.
         """
         print(f"[Rank 0] Starting Sequential Tidal Prefill for {self.num_blocks} blocks.")
+        print(f"[Rank 0] Using block-wise attention accumulation across all layers.")
+        
+        # Get the accumulator for this model
+        accumulator = get_or_create_accumulator(self.model)
         
         # These track the *sparse* set of tokens we want to keep
         anchor_token_ids: Optional[torch.Tensor] = None
         anchor_pos_ids: Optional[torch.Tensor] = None
-        anchor_kv_cache: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None
 
-        full_input_ids: Optional[torch.Tensor] = None # Tracks all processed tokens
-        full_pos_ids: Optional[torch.Tensor] = None   # Tracks all processed pos_ids
+        full_input_ids: Optional[torch.Tensor] = None
+        full_pos_ids: Optional[torch.Tensor] = None
         
-        master_anchor_pos_set: Set[int] = set() # Tracks unique pos_ids of anchors
+        # Master set of all anchor position IDs across all blocks
+        master_anchor_pos_set: Set[int] = set()
+        
+        # Store selected tokens per block for building sparse cache
+        all_selected_positions: List[int] = []
 
         for i in range(self.num_blocks):
-            print(f"[Rank 0] Processing block {i+1} / {self.num_blocks}...")
+            print(f"\n[Rank 0] Processing block {i+1} / {self.num_blocks}...")
             block_ids = ctx_id_blocks[i]
             block_pos_ids = pos_id_blocks[i]
             
-            # --- 1. Prepare Inputs for this step ---
-            # The model processes the *new block* plus all *previous blocks*
-            # This is standard prefill, but we will only *keep* the sparse anchors.
-            if full_input_ids is None:
-                current_input_ids = block_ids
-                current_pos_ids = block_pos_ids
-            else:
-                current_input_ids = torch.cat([full_input_ids, block_ids], dim=-1)
-                current_pos_ids = torch.cat([full_pos_ids, block_pos_ids], dim=-1)
+            block_start_pos = block_pos_ids[0, 0].item()
+            block_end_pos = block_pos_ids[0, -1].item()
+            print(f"[Rank 0] Block positions: {block_start_pos} to {block_end_pos}")
             
-            # Update the full history
-            full_input_ids = current_input_ids
-            full_pos_ids = current_pos_ids
-
-            # We pass the *sparse* cache from the *previous* step
-            # The model will recompute KVs for the new block and concat them
-            # This is inefficient, but a pure-python implementation requires it.
-            # A custom kernel would append to the cache.
-            # For now, we re-compute the sparse anchor KVs + the new block KVs.
-            # We must pass the *tokens* and *positions* for the anchors,
-            # plus the *tokens* and *positions* for the new block.
+            # --- 1. Start block accumulation ---
+            # This tells the attention layers to start accumulating scores
+            start_block_accumulation(self.model, block_pos_ids)
+            
+            # --- 2. Prepare inputs for this step ---
             if anchor_token_ids is None:
                 step_input_ids = block_ids
                 step_pos_ids = block_pos_ids
@@ -416,145 +406,103 @@ class StarAttentionModel(DistributedInferenceBaseModel):
                 step_input_ids = torch.cat([anchor_token_ids, block_ids], dim=-1)
                 step_pos_ids = torch.cat([anchor_pos_ids, block_pos_ids], dim=-1)
             
-            # --- 2. Run Model Forward Pass ---
-            # Clear history for this *block*
-            # Note: We call clear on the *inner* model
-            self.model.model.clear_top_tokens_history()
-            
+            # --- 3. Run Model Forward Pass ---
+            # Attention scores are accumulated across ALL layers
+            # Selection happens automatically at the final layer
             outputs = self.model(
                 input_ids=step_input_ids,
                 position_ids=step_pos_ids,
-                past_key_values=None, # We recompute KVs each time
+                past_key_values=None,
                 use_cache=True,
-                # These are the custom args for our modified attention
-                selection_layers=self.selection_layers,
-                prefill_block_idx=i, # Use block index as the step key
             )
             
-            # This cache contains KVs for (anchor_tokens + block_tokens)
             full_kv_cache_this_step = outputs.past_key_values
             
-            # --- 3. Extract New Anchors ---
-            # Get the sampled token indices (as position IDs) for this block
-            history = self.model.model.get_top_tokens_for_step(i)
-            if not history:
-                print(f"[Rank 0] Warning: No tokens sampled for block {i}.")
+            # --- 4. Get selected tokens from the last layer's output ---
+            # The chosen_tokens are returned as (indices, position_ids) from the final layer
+            # We need to check if selection was made
+            
+            # Check if we got selected tokens (stored on the model after forward pass)
+            if hasattr(self.model, '_last_block_selection'):
+                selected_indices, selected_position_ids = self.model._last_block_selection
+                del self.model._last_block_selection
+            else:
+                # Fallback: manually select if accumulator has data
+                # This shouldn't happen if the forward pass worked correctly
+                selected_indices, selected_position_ids = [], []
+                print(f"[Rank 0] Warning: No selection result from forward pass for block {i}")
+            
+            if not selected_position_ids:
+                print(f"[Rank 0] Warning: No tokens selected for block {i}.")
                 continue
-
-            new_anchor_pos_set: Set[int] = set()
-            for layer_idx in self.selection_layers:
-                if layer_idx in history:
-                    new_anchor_pos_set.update(history[layer_idx])
             
-            # Filter this set to *only* include positions from the *current block*
-            block_start_pos = block_pos_ids[0, 0].item()
-            block_end_pos = block_pos_ids[0, -1].item()
+            # Filter to only include positions from the *current block*
+            new_block_positions = [
+                p for p in selected_position_ids 
+                if block_start_pos <= p <= block_end_pos
+            ]
             
-            new_block_anchor_positions = sorted(
-                [p for p in new_anchor_pos_set if block_start_pos <= p <= block_end_pos]
-            )
-            
-            if not new_block_anchor_positions:
-                print(f"[Rank 0] No *new* anchor tokens found in block {i}.")
-                # We still need to rebuild the sparse cache from previous anchors
-                if anchor_pos_ids is not None:
-                    anchor_indices = anchor_pos_ids[0]
-                    anchor_kv_cache = self._gather_kv_cache(
-                        full_kv_cache_this_step, anchor_indices
-                    )
+            if not new_block_positions:
+                print(f"[Rank 0] No new anchor tokens found in block {i}.")
                 continue
-
-            print(f"[Rank 0] Found {len(new_block_anchor_positions)} new anchor tokens in block {i}.")
-
-            # Add to the master set of all anchor positions
-            master_anchor_pos_set.update(new_block_anchor_positions)
+                
+            print(f"[Rank 0] Selected {len(new_block_positions)} anchor tokens from block {i}.")
             
-            # --- 4. Update Sparse Anchor State for Next Loop ---
+            # --- 5. Update anchor state ---
+            master_anchor_pos_set.update(new_block_positions)
             
-            # Get the token_ids for these new positions
+            # Get token IDs for these positions
             relative_indices = torch.tensor(
-                [p - block_start_pos for p in new_block_anchor_positions],
+                [p - block_start_pos for p in new_block_positions],
                 device=self.model.device, dtype=torch.long
             )
             new_anchor_tokens = torch.index_select(block_ids, dim=1, index=relative_indices)
             new_anchor_positions = torch.tensor(
-                [new_block_anchor_positions], device=self.model.device, dtype=torch.long
+                [new_block_positions], device=self.model.device, dtype=torch.long
             )
-
-            # Update the master list of anchor tokens and positions
+            
             if anchor_token_ids is None:
                 anchor_token_ids = new_anchor_tokens
                 anchor_pos_ids = new_anchor_positions
             else:
                 anchor_token_ids = torch.cat([anchor_token_ids, new_anchor_tokens], dim=-1)
                 anchor_pos_ids = torch.cat([anchor_pos_ids, new_anchor_positions], dim=-1)
-
-            # --- 5. Re-build Sparse KV Cache ---
-            # This is the most critical step. We must slice the
-            # `full_kv_cache_this_step` to keep *only* the KVs for
-            # tokens in our `master_anchor_pos_set`.
             
-            # The `full_kv_cache_this_step` corresponds to `step_input_ids`.
-            # We need the *relative indices* within that cache.
+            # --- 6. Build position-to-index map for KV cache gathering ---
             all_anchor_pos_list = sorted(list(master_anchor_pos_set))
-            
-            # Find the indices of our anchors within the `step_pos_ids`
-            # This is complex. Let's simplify.
-            # `full_kv_cache_this_step` has shape (..., seq_len, ...)
-            # where seq_len = anchor_pos_ids.shape[1] + block_pos_ids.shape[1]
-            # The first N are anchors, the last M are the block.
-            
-            # Let's rebuild the cache from *all* anchors found so far
-            master_anchor_indices = torch.tensor(
-                sorted(list(master_anchor_pos_set)), 
-                device=self.model.device, dtype=torch.long
-            )
-            
-            # We must map these *global* positions to the *relative* indices
-            # in the `full_kv_cache_this_step`.
-            
-            # `step_pos_ids` looks like [5, 12, 18, | 1024, 1025, ..., 2047]
-            # `master_anchor_indices` looks like [5, 12, 18, | 1028, 1030, 1500]
-            
-            # Let's build a map from pos_id -> relative_index
             pos_to_idx_map = {pos_id.item(): idx for idx, pos_id in enumerate(step_pos_ids[0])}
             
             relative_indices_to_gather = [
-                pos_to_idx_map[pos_id] for pos_id in all_anchor_pos_list 
+                pos_to_idx_map[pos_id] for pos_id in all_anchor_pos_list
                 if pos_id in pos_to_idx_map
             ]
             
             if not relative_indices_to_gather:
-                 print(f"[Rank 0] Warning: No anchor tokens to gather for block {i}.")
-                 continue
+                print(f"[Rank 0] Warning: No anchor tokens to gather for block {i}.")
+                continue
             
             relative_indices_tensor = torch.tensor(
                 relative_indices_to_gather,
                 device=self.model.device, dtype=torch.long
             )
-
+            
             anchor_kv_cache = self._gather_kv_cache(
                 full_kv_cache_this_step, relative_indices_tensor
             )
+            
+            # Note: The accumulator is automatically cleaned up in finish_block()
+            # which is called at the final layer during forward pass
 
-        print(f"[Rank 0] Sequential prefill complete. Total anchor tokens: {len(master_anchor_pos_set)}")
+        print(f"\n[Rank 0] Sequential prefill complete. Total anchor tokens: {len(master_anchor_pos_set)}")
         
-        # After the loop, anchor_kv_cache holds the final sparse cache
-        # And anchor_pos_ids holds the corresponding positions
-        # We need to return the cache and the *original* context length
-        
-        # We also need to get the final, unpadded context length
-        # `pos_id_blocks` includes padding. `ctx_len` is the original.
-        # But Phase 2 needs the *padded* length to calc query pos_ids
-        
-        # The query position IDs should start *after* the *original* context
+        # Final processing
         self.final_context_len = pos_id_blocks[0].shape[-1] * self.num_blocks
 
-        # Trim padding from the final cache
         if anchor_pos_ids is None:
-             print("[Rank 0] Error: No anchor tokens found in any block.")
-             return None, 0
-             
+            print("[Rank 0] Error: No anchor tokens found in any block.")
+            return None
+        
+        # Trim padding from the final cache
         final_anchor_pos = anchor_pos_ids[0]
         unpadded_mask = final_anchor_pos < self.final_context_len
         unpadded_indices = torch.where(unpadded_mask)[0]
@@ -900,7 +848,6 @@ class CustomAccuracyModel:
                     distances = np.linalg.norm(cluster_points - centroid, axis=1)
                     closest_point_idx = np.argmin(distances)
                     # Get global index
-                    global_indices = np.where(cluster_mask)[0]
                     global_idx = np.where(clusters == i)[0][closest_point_idx]
                     selected_indices.append(global_idx)
             
@@ -948,8 +895,7 @@ class CustomAccuracyModel:
         # === PHASE 1: BUILD FULL CONTEXT KV CACHE ===
         with torch.no_grad():
             print("\n--- Phase 1, Pass 1: Generating summaries... ---")
-            # ... (This section is correct and remains unchanged) ...
-            model_eager = LlamaForCausalLM.from_pretrained(
+            model_eager = self.LlamaForCausalLM.from_pretrained(
                 self.model_path, torch_dtype=torch.bfloat16, device_map='auto', attn_implementation='eager'
             ).eval()
             summaries = [self._get_summary(model_eager, block) for block in context_blocks]
@@ -958,7 +904,6 @@ class CustomAccuracyModel:
             print("--- [Pass 1] All summaries generated. ---")
 
             print("\n--- Phase 1, Pass 2: Building final KV cache incrementally... ---")
-            # ... (This section is correct and remains unchanged) ...
             full_kv_cache_tuple = None
             for i, block in enumerate(context_blocks):
                 previous_summaries = summaries[:i]

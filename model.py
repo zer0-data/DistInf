@@ -19,6 +19,18 @@ from typing import Dict, List, Optional, Tuple, Set
 import torch
 import torch.distributed as dist
 from transformers import AutoTokenizer
+from transformers.cache_utils import DynamicCache
+
+# --- NEW IMPORTS for k-means clustering ---
+import numpy as np
+try:
+    from sklearn.cluster import KMeans
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    print("Warning: sklearn not installed. K-means summarization will not be available.")
+    print("Install with: pip install scikit-learn")
+    KMeans = None
+    SKLEARN_AVAILABLE = False
 
 # --- NEW IMPORTS for Tidal-Prefill ---
 # We import our custom 'load' function from the src package
@@ -180,8 +192,20 @@ class DistributedInferenceBaseModel:
 
         return generated_text.strip()
 
-    def __call__(self, prompt_context: str, prompt_query: str):
-        raise NotImplementedError
+    def __call__(self, prompt_context: str, prompt_query: str) -> Dict[str, List[str]]:
+        context_ids = self.tokenizer.encode(prompt_context, return_tensors='pt').to(self.device)
+        context_blocks = list(context_ids.split(self.block_size, dim=1))
+        
+        # === PHASE 1: BUILD FULL CONTEXT KV CACHE ===
+        with torch.no_grad():
+            print("\n--- Phase 1, Pass 1: Generating summaries... ---")
+            model_eager = self.LlamaForCausalLM.from_pretrained(
+                self.model_path, torch_dtype=torch.bfloat16, device_map='auto', attn_implementation='eager'
+            ).eval()
+            summaries = [self._get_summary(model_eager, block) for block in context_blocks]
+            del model_eager
+            torch.cuda.empty_cache()
+            print("--- [Pass 1] All summaries generated. ---")
 
 
 # [ Original RingAttentionModel class is skipped as it is not being modified ]
@@ -794,12 +818,23 @@ class CustomAccuracyModel:
                  stop_words: Optional[List[str]] = None, summary_method: str = 'top_k'):
         if not torch.cuda.is_available():
             raise RuntimeError("This implementation requires a CUDA-enabled GPU.")
+
+        # Validate summary_method
+        if summary_method == 'kmeans' and not SKLEARN_AVAILABLE:
+            raise RuntimeError(
+                "K-means summarization requires sklearn. "
+                "Install with: pip install scikit-learn"
+            )
         
         self.device = "cuda"
         self.model_path = path
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_path)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        
+        # Import LlamaForCausalLM here to avoid circular imports
+        from transformers import LlamaForCausalLM
+        self.LlamaForCausalLM = LlamaForCausalLM
         
         print("\n[SETUP] Loading primary model with Flash Attention 2 in bfloat16...")
         self.model_flash = LlamaForCausalLM.from_pretrained(
@@ -821,6 +856,14 @@ class CustomAccuracyModel:
         print("[SETUP] Initialization complete.")
 
     def _get_kmeans_summary(self, model_eager, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Use k-means clustering on token hidden states to select representative tokens.
+        This method clusters tokens based on their semantic representations and
+        selects the token closest to each cluster centroid.
+        """
+        if KMeans is None:
+            raise RuntimeError("sklearn is required for k-means summarization")
+        
         with torch.no_grad():
             chunks = list(input_ids.split(self.summary_chunk_size, dim=1))
             all_hidden_states = []
@@ -838,7 +881,7 @@ class CustomAccuracyModel:
             combined_states = torch.cat(all_hidden_states, dim=0)
             
             # Convert to numpy for sklearn
-            features = combined_states.cpu().numpy()
+            features = combined_states.float().cpu().numpy()
             
             # Apply k-means clustering
             n_clusters = min(self.k, features.shape[0])
@@ -857,6 +900,7 @@ class CustomAccuracyModel:
                     distances = np.linalg.norm(cluster_points - centroid, axis=1)
                     closest_point_idx = np.argmin(distances)
                     # Get global index
+                    global_indices = np.where(cluster_mask)[0]
                     global_idx = np.where(clusters == i)[0][closest_point_idx]
                     selected_indices.append(global_idx)
             

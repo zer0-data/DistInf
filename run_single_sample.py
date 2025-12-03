@@ -40,14 +40,14 @@ def main(args):
     print("-" * 22)
 
     # 2. Load the Custom Accuracy Model
-    # This will instantiate your class and print the detailed setup logs
     print("\n--- 2. Loading Model ---")
-    # The CustomAccuracyModel handles all the complex logic internally
+    print(f"Using summary method: {args.summary_method}")
     model = CustomAccuracyModel(
         path=args.model_path,
         max_new_tokens=args.max_new_tokens,
         block_size=args.block_size,
         k_summary_size=args.k_summary_size,
+        summary_method=args.summary_method,  # NEW: Pass the summary method
     )
     print("Model loaded successfully.")
 
@@ -56,7 +56,6 @@ def main(args):
     print("The model will now print detailed debug logs for each step...")
     start_time = time.time()
     
-    # The __call__ method of your model runs the entire two-pass process
     result = model(prompt_context=context, prompt_query=query)
     
     end_time = time.time()
@@ -101,6 +100,13 @@ if __name__ == '__main__':
         type=int, 
         default=100, 
         help='Maximum number of new tokens to generate for the answer'
+    )
+    parser.add_argument(
+        '--summary_method',
+        type=str,
+        default='top_k',
+        choices=['top_k', 'kmeans'],
+        help='Method for summarizing context blocks: "top_k" (attention-based) or "kmeans" (clustering-based)'
     )
     
     args = parser.parse_args()

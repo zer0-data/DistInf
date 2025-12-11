@@ -759,20 +759,27 @@ class DenseAttentionModel:
 
 class CustomAccuracyModel:
     """
-    Implements the custom two-pass mechanism for improved accuracy on a single GPU.
-    FINAL VERSION: Replaces the broken .generate() method with a fully manual
-    decoding loop to guarantee correct execution.
+    Implements the SqueezedAttention-style two-pass mechanism:
+    
+    Phase 1 - Pass 1: For each block, cluster tokens and select representatives (summaries)
+    Phase 1 - Pass 2: Build KV cache with context propagation:
+        Block 1: Just Block1
+        Block 2: Summary1 + Block2  
+        Block 3: Summary1 + Summary2 + Block3
+        Block 4: Summary1 + Summary2 + Summary3 + Block4
+    Phase 2: Generate response using the full KV cache
     """
 
     def __init__(self, path: str, max_new_tokens: int, block_size: int, k_summary_size: int, 
-                 stop_words: Optional[List[str]] = None, summary_method: str = 'top_k',
-                 pruning_percent: float = 90.0, 
-                 # New parameters for improved k-means
+                 stop_words: Optional[List[str]] = None, summary_method: str = 'kmeans',
+                 pruning_percent: float = 75.0, 
+                 # K-means parameters (SqueezedAttention style)
                  use_cosine_similarity: bool = True,
                  multi_layer_aggregation: bool = True,
                  layer_weights: Optional[List[float]] = None,
-                 query_guided: bool = True,
-                 query_weight: float = 0.3):
+                 query_guided: bool = False,
+                 query_weight: float = 0.3,
+                 num_layers_for_clustering: int = 4):
         if not torch.cuda.is_available():
             raise RuntimeError("This implementation requires a CUDA-enabled GPU.")
 
@@ -783,9 +790,12 @@ class CustomAccuracyModel:
                 "Install with: pip install scikit-learn"
             )
         
-        # Validate pruning_percent
+        # Validate pruning_percent - should be between 0 and 100
         if not 0 < pruning_percent < 100:
-            raise ValueError("pruning_percent must be between 0 and 100 (exclusive)")
+            raise ValueError(
+                f"pruning_percent must be between 0 and 100 (exclusive), got {pruning_percent}. "
+                f"E.g., pruning_percent=90 means prune 90% of tokens (keep 10%)."
+            )
         
         self.device = "cuda"
         self.model_path = path
@@ -793,18 +803,22 @@ class CustomAccuracyModel:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         
-        # Import LlamaForCausalLM here to avoid circular imports
-        from transformers import LlamaForCausalLM
-        self.LlamaForCausalLM = LlamaForCausalLM
-        
         print("\n[SETUP] Loading primary model with Flash Attention 2 in bfloat16...")
-        self.model_flash = LlamaForCausalLM.from_pretrained(
+        
+        # Import AutoModelForCausalLM - this works for all model types
+        from transformers import AutoModelForCausalLM
+        
+        self.model_flash = AutoModelForCausalLM.from_pretrained(
             self.model_path,
             torch_dtype=torch.bfloat16,
             device_map='auto',
             attn_implementation='flash_attention_2',
+            trust_remote_code=True,
         )
         self.model_flash.eval()
+        
+        # Store the class for later use (for loading eager model)
+        self._model_class = AutoModelForCausalLM
 
         self.max_new_tokens = max_new_tokens
         self.stop_words = stop_words if stop_words else []
@@ -814,251 +828,230 @@ class CustomAccuracyModel:
         self.summary_method = summary_method
         self.pruning_percent = pruning_percent
         
-        # New k-means improvement parameters
+        # K-means / SqueezedAttention parameters
         self.use_cosine_similarity = use_cosine_similarity
         self.multi_layer_aggregation = multi_layer_aggregation
-        self.layer_weights = layer_weights  # None means auto-weight (later layers weighted more)
+        self.layer_weights = layer_weights
         self.query_guided = query_guided
-        self.query_weight = query_weight  # How much to weight query relevance vs diversity
+        self.query_weight = query_weight
+        self.num_layers_for_clustering = num_layers_for_clustering
         
-        print(f"[SETUP] Using summary_chunk_size of {self.summary_chunk_size} to manage memory.")
-        print(f"[SETUP] Using summary method: {summary_method}")
+        print(f"[SETUP] Block size: {block_size}")
+        print(f"[SETUP] Summary method: {summary_method}")
         if summary_method == 'kmeans':
-            print(f"[SETUP] Pruning percentage: {pruning_percent}% (keeping {100 - pruning_percent}% of tokens)")
-            print(f"[SETUP] K-means improvements:")
-            print(f"        - Cosine similarity: {use_cosine_similarity}")
-            print(f"        - Multi-layer aggregation: {multi_layer_aggregation}")
-            print(f"        - Query-guided selection: {query_guided}")
-            if query_guided:
-                print(f"        - Query weight: {query_weight}")
+            print(f"[SETUP] Pruning: {pruning_percent}% (keeping {100 - pruning_percent:.1f}% of tokens per block)")
+            print(f"[SETUP] Cosine similarity: {use_cosine_similarity}")
+            print(f"[SETUP] Multi-layer aggregation: {multi_layer_aggregation} ({num_layers_for_clustering} layers)")
         print("[SETUP] Initialization complete.")
 
-    def _get_multi_layer_hidden_states(
+    def _extract_hidden_states_for_clustering(
         self, 
         model_eager, 
         input_ids: torch.Tensor,
-        num_layers_to_use: int = 4
     ) -> torch.Tensor:
         """
-        Extract and aggregate hidden states from multiple layers.
+        Extract hidden states for clustering.
         
-        Args:
-            model_eager: Model with eager attention
-            input_ids: Input token IDs
-            num_layers_to_use: Number of layers to aggregate (from the end)
-            
+        SqueezedAttention approach: Use hidden states from later layers
+        as they contain more semantic information.
+        
         Returns:
-            Aggregated hidden states tensor of shape (seq_len, hidden_dim)
+            Hidden states tensor of shape (seq_len, hidden_dim)
         """
         with torch.no_grad():
+            # Process in chunks to manage memory
             chunks = list(input_ids.split(self.summary_chunk_size, dim=1))
-            all_aggregated_states = []
+            all_hidden_states = []
             
             for chunk in chunks:
                 outputs = model_eager(chunk, output_hidden_states=True)
-                hidden_states_tuple = outputs.hidden_states  # Tuple of (num_layers + 1) tensors
+                hidden_states_tuple = outputs.hidden_states  # (num_layers + 1,) tensors
                 
-                num_total_layers = len(hidden_states_tuple) - 1  # Exclude embedding layer
-                layers_to_use = min(num_layers_to_use, num_total_layers)
-                
-                # Get the last N layers (excluding embedding layer at index 0)
-                selected_layers = hidden_states_tuple[-layers_to_use:]
-                
-                # Compute layer weights if not provided
-                if self.layer_weights is None:
-                    # Exponentially increasing weights for later layers
-                    weights = torch.tensor(
-                        [2 ** i for i in range(layers_to_use)],
-                        dtype=torch.float32,
-                        device=self.device
-                    )
-                    weights = weights / weights.sum()  # Normalize
+                if self.multi_layer_aggregation:
+                    # Aggregate from last N layers (SqueezedAttention style)
+                    num_total_layers = len(hidden_states_tuple) - 1  # Exclude embedding
+                    layers_to_use = min(self.num_layers_for_clustering, num_total_layers)
+                    
+                    # Get last N layers
+                    selected_layers = hidden_states_tuple[-layers_to_use:]
+                    
+                    # Compute weights (later layers get more weight)
+                    if self.layer_weights is None:
+                        weights = torch.tensor(
+                            [2 ** i for i in range(layers_to_use)],
+                            dtype=torch.float32,
+                            device=self.device
+                        )
+                        weights = weights / weights.sum()
+                    else:
+                        weights = torch.tensor(self.layer_weights[-layers_to_use:], device=self.device)
+                        weights = weights / weights.sum()
+                    
+                    # Weighted sum
+                    aggregated = torch.zeros_like(selected_layers[0].squeeze(0))
+                    for layer_states, weight in zip(selected_layers, weights):
+                        aggregated += weight * layer_states.squeeze(0)
+                    
+                    all_hidden_states.append(aggregated)
                 else:
-                    weights = torch.tensor(self.layer_weights[-layers_to_use:], device=self.device)
-                    weights = weights / weights.sum()
+                    # Use only last layer
+                    last_hidden = outputs.hidden_states[-1].squeeze(0)
+                    all_hidden_states.append(last_hidden)
                 
-                # Weighted aggregation of hidden states
-                aggregated = torch.zeros_like(selected_layers[0].squeeze(0))
-                for layer_states, weight in zip(selected_layers, weights):
-                    aggregated += weight * layer_states.squeeze(0)
-                
-                all_aggregated_states.append(aggregated)
-                
-                del outputs, hidden_states_tuple, selected_layers
+                del outputs
                 torch.cuda.empty_cache()
             
-            return torch.cat(all_aggregated_states, dim=0)
+            return torch.cat(all_hidden_states, dim=0)
 
-    def _compute_query_relevance_scores(
+    def _cluster_and_select_representatives(
         self,
-        token_features: np.ndarray,
-        query_features: np.ndarray
-    ) -> np.ndarray:
-        """
-        Compute relevance scores for each token based on similarity to query.
-        
-        Args:
-            token_features: Token hidden states (num_tokens, hidden_dim)
-            query_features: Query hidden states (num_query_tokens, hidden_dim)
-            
-        Returns:
-            Relevance scores for each token (num_tokens,)
-        """
-        if cosine_similarity is None:
-            raise RuntimeError("sklearn is required for cosine similarity")
-        
-        # Compute cosine similarity between each token and all query tokens
-        # Shape: (num_tokens, num_query_tokens)
-        similarities = cosine_similarity(token_features, query_features)
-        
-        # Take max similarity to any query token as the relevance score
-        relevance_scores = similarities.max(axis=1)
-        
-        return relevance_scores
-
-    def _get_kmeans_summary(
-        self, 
-        model_eager, 
+        hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
-        query_ids: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        n_clusters: int,
+    ) -> Tuple[torch.Tensor, List[int]]:
         """
-        Use k-means clustering on token hidden states to select representative tokens.
-        
-        Improvements over basic k-means:
-        1. Uses cosine similarity instead of Euclidean distance
-        2. Aggregates hidden states from multiple layers
-        3. Query-guided selection: biases selection toward query-relevant tokens
+        SqueezedAttention-style clustering and selection:
+        1. Run k-means on hidden states
+        2. For each cluster, select the token closest to centroid
         
         Args:
-            model_eager: Model with eager attention for getting hidden states
-            input_ids: Context token IDs
-            query_ids: Optional query token IDs for query-guided selection
+            hidden_states: (seq_len, hidden_dim) tensor
+            input_ids: (1, seq_len) tensor
+            n_clusters: Number of clusters (tokens to keep)
             
         Returns:
-            Selected summary token IDs
+            summary_ids: (1, n_selected) token IDs
+            selected_indices: List of selected token indices
         """
         if KMeans is None:
-            raise RuntimeError("sklearn is required for k-means summarization")
+            raise RuntimeError("sklearn is required for k-means clustering")
         
-        with torch.no_grad():
-            # Step 1: Extract hidden states
-            if self.multi_layer_aggregation:
-                combined_states = self._get_multi_layer_hidden_states(model_eager, input_ids)
-            else:
-                # Original single-layer approach
-                chunks = list(input_ids.split(self.summary_chunk_size, dim=1))
-                all_hidden_states = []
-                for chunk in chunks:
-                    outputs = model_eager(chunk, output_hidden_states=True)
-                    hidden_states = outputs.hidden_states[-1].squeeze(0)
-                    all_hidden_states.append(hidden_states)
-                    del outputs
-                    torch.cuda.empty_cache()
-                combined_states = torch.cat(all_hidden_states, dim=0)
+        # Convert to numpy for sklearn
+        features = hidden_states.float().cpu().numpy()
+        
+        # Normalize for cosine similarity-based clustering
+        if self.use_cosine_similarity:
+            norms = np.linalg.norm(features, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1, norms)
+            features = features / norms
+        
+        # Run k-means
+        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        cluster_labels = kmeans.fit_predict(features)
+        centroids = kmeans.cluster_centers_
+        
+        # Select representative from each cluster (closest to centroid)
+        selected_indices = []
+        
+        for cluster_id in range(n_clusters):
+            # Get indices of tokens in this cluster
+            cluster_mask = (cluster_labels == cluster_id)
+            cluster_indices = np.where(cluster_mask)[0]
             
-            total_tokens = combined_states.shape[0]
+            if len(cluster_indices) == 0:
+                continue
             
-            # Calculate number of tokens to keep based on pruning percentage
-            keep_percent = (100 - self.pruning_percent) / 100.0
-            n_clusters = max(1, int(total_tokens * keep_percent))
+            # Get features of tokens in this cluster
+            cluster_features = features[cluster_mask]
+            centroid = centroids[cluster_id]
             
-            print(f"    [K-means] Total tokens: {total_tokens}, Pruning: {self.pruning_percent}%, Keeping: {n_clusters} tokens")
-            
-            # Step 2: Normalize features for cosine similarity-based clustering
-            features = combined_states.float().cpu().numpy()
-            
+            # Compute distance to centroid
             if self.use_cosine_similarity:
-                # L2 normalize features so Euclidean distance ≈ cosine distance
-                norms = np.linalg.norm(features, axis=1, keepdims=True)
-                norms = np.where(norms == 0, 1, norms)  # Avoid division by zero
-                features = features / norms
-                print(f"    [K-means] Using cosine similarity (L2 normalized features)")
+                # Cosine distance = 1 - cosine_similarity
+                # For normalized vectors: cosine_sim = dot product
+                similarities = cluster_features @ centroid
+                distances = 1 - similarities
+            else:
+                distances = np.linalg.norm(cluster_features - centroid, axis=1)
             
-            # Step 3: Compute query relevance scores if query-guided
-            query_relevance = None
-            if self.query_guided and query_ids is not None:
-                print(f"    [K-means] Computing query-guided relevance scores...")
-                
-                # Get query hidden states
-                if self.multi_layer_aggregation:
-                    query_states = self._get_multi_layer_hidden_states(model_eager, query_ids)
-                else:
-                    outputs = model_eager(query_ids, output_hidden_states=True)
-                    query_states = outputs.hidden_states[-1].squeeze(0)
-                    del outputs
-                    torch.cuda.empty_cache()
-                
-                query_features = query_states.float().cpu().numpy()
-                
-                if self.use_cosine_similarity:
-                    query_norms = np.linalg.norm(query_features, axis=1, keepdims=True)
-                    query_norms = np.where(query_norms == 0, 1, query_norms)
-                    query_features = query_features / query_norms
-                
-                query_relevance = self._compute_query_relevance_scores(features, query_features)
-                print(f"    [K-means] Query relevance scores computed (min: {query_relevance.min():.3f}, max: {query_relevance.max():.3f})")
+            # Select token with minimum distance to centroid
+            best_idx_in_cluster = np.argmin(distances)
+            global_idx = cluster_indices[best_idx_in_cluster]
+            selected_indices.append(int(global_idx))
+        
+        # Sort to maintain original sequence order (important for positional encoding)
+        selected_indices.sort()
+        
+        # Extract selected token IDs
+        selected_indices_tensor = torch.tensor(selected_indices, device=input_ids.device, dtype=torch.long)
+        summary_ids = input_ids[:, selected_indices_tensor]
+        
+        return summary_ids, selected_indices
+
+    def _get_block_summary(
+        self,
+        model_eager,
+        block_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Generate summary for a single block using SqueezedAttention approach:
+        1. Extract hidden states
+        2. Cluster tokens
+        3. Select representative tokens
+        
+        Args:
+            model_eager: Model with eager attention
+            block_ids: (1, block_len) token IDs
             
-            # Step 4: Apply k-means clustering
-            print(f"    [K-means] Running k-means with {n_clusters} clusters...")
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            clusters = kmeans.fit_predict(features)
-            centroids = kmeans.cluster_centers_
+        Returns:
+            summary_ids: (1, n_summary) selected token IDs
+        """
+        block_len = block_ids.shape[1]
+        
+        # Calculate number of tokens to keep
+        keep_ratio = (100.0 - self.pruning_percent) / 100.0
+        n_clusters = max(1, int(block_len * keep_ratio))
+        
+        print(f"    [Clustering] Block size: {block_len}, Keeping: {n_clusters} tokens ({100 - self.pruning_percent:.1f}%)")
+        
+        # Extract hidden states for clustering
+        hidden_states = self._extract_hidden_states_for_clustering(model_eager, block_ids)
+        
+        # Cluster and select representatives
+        summary_ids, selected_indices = self._cluster_and_select_representatives(
+            hidden_states, block_ids, n_clusters
+        )
+        
+        print(f"    [Clustering] Selected {len(selected_indices)} representative tokens")
+        
+        return summary_ids
+
+    def _get_top_k_summary(
+        self, 
+        model_eager, 
+        input_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Original top-k attention-based summary extraction.
+        """
+        with torch.no_grad():
+            chunks = list(input_ids.split(self.summary_chunk_size, dim=1))
+            all_attention_scores = []
             
-            # Step 5: Select representative tokens from each cluster
-            selected_indices = []
-            
-            for i in range(n_clusters):
-                cluster_mask = (clusters == i)
-                cluster_indices = np.where(cluster_mask)[0]
-                cluster_points = features[cluster_mask]
+            for chunk in chunks:
+                outputs = model_eager(chunk, output_attentions=True)
+                attentions = outputs.attentions  # Tuple of (bsz, num_heads, seq_len, seq_len)
                 
-                if len(cluster_points) == 0:
-                    continue
+                # Average attention across layers and heads
+                stacked_attentions = torch.stack(attentions, dim=0)  # (num_layers, bsz, heads, seq, seq)
+                avg_attention = stacked_attentions.mean(dim=(0, 1, 2))  # (seq, seq)
                 
-                # Compute distance to centroid
-                centroid = centroids[i]
-                if self.use_cosine_similarity:
-                    # For normalized vectors, cosine similarity = dot product
-                    # Distance = 1 - similarity
-                    similarities = cluster_points @ centroid
-                    distances = 1 - similarities
-                else:
-                    distances = np.linalg.norm(cluster_points - centroid, axis=1)
+                # Sum attention received by each token
+                token_importance = avg_attention.sum(dim=0)  # (seq,)
+                all_attention_scores.append(token_importance)
                 
-                # If query-guided, combine centroid distance with query relevance
-                if query_relevance is not None:
-                    cluster_relevance = query_relevance[cluster_mask]
-                    
-                    # Normalize distances and relevance to [0, 1]
-                    if distances.max() > distances.min():
-                        norm_distances = (distances - distances.min()) / (distances.max() - distances.min())
-                    else:
-                        norm_distances = np.zeros_like(distances)
-                    
-                    if cluster_relevance.max() > cluster_relevance.min():
-                        norm_relevance = (cluster_relevance - cluster_relevance.min()) / (cluster_relevance.max() - cluster_relevance.min())
-                    else:
-                        norm_relevance = np.ones_like(cluster_relevance)
-                    
-                    # Combined score: low distance (close to centroid) + high relevance
-                    # Lower score is better
-                    combined_scores = (1 - self.query_weight) * norm_distances - self.query_weight * norm_relevance
-                    best_idx_in_cluster = np.argmin(combined_scores)
-                else:
-                    # Just use distance to centroid
-                    best_idx_in_cluster = np.argmin(distances)
-                
-                global_idx = cluster_indices[best_idx_in_cluster]
-                selected_indices.append(global_idx)
+                del outputs, attentions, stacked_attentions
+                torch.cuda.empty_cache()
             
-            # Sort indices to maintain sequence order
-            selected_indices.sort()
+            # Combine scores from all chunks
+            combined_scores = torch.cat(all_attention_scores, dim=0)
             
-            print(f"    [K-means] Selected {len(selected_indices)} representative tokens")
+            # Select top-k
+            k = min(self.k, combined_scores.shape[0])
+            _, top_indices = torch.topk(combined_scores, k)
+            top_indices = top_indices.sort().values
             
-            selected_indices_tensor = torch.tensor(selected_indices, device=input_ids.device, dtype=torch.long)
-            summary_ids = input_ids[:, selected_indices_tensor]
+            summary_ids = input_ids[:, top_indices]
             
             return summary_ids
 
@@ -1068,50 +1061,113 @@ class CustomAccuracyModel:
         input_ids: torch.Tensor,
         query_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
+        """
+        Get summary tokens for a block.
+        """
         if self.summary_method == 'kmeans':
-            return self._get_kmeans_summary(model_eager, input_ids, query_ids)
-        else:  # default to top_k
+            return self._get_block_summary(model_eager, input_ids)
+        else:
             return self._get_top_k_summary(model_eager, input_ids)
 
-    # ...existing code for _get_top_k_summary, _get_output_text...
+    def _get_output_text(self, output_ids: torch.Tensor, num_input_tokens: int) -> str:
+        """Convert generated token IDs to text."""
+        generated_ids = output_ids[:, num_input_tokens:]
+        generated_text = self.tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        
+        for s in self.stop_words:
+            generated_text = generated_text.split(s)[0]
+        
+        return generated_text.strip()
 
     def __call__(self, prompt_context: str, prompt_query: str) -> Dict[str, List[str]]:
-        context_ids = self.tokenizer.encode(prompt_context, return_tensors='pt').to(self.device)
-        query_ids_for_guidance = self.tokenizer.encode(prompt_query, return_tensors='pt').to(self.device) if self.query_guided else None
-        context_blocks = list(context_ids.split(self.block_size, dim=1))
+        """
+        Main inference method implementing SqueezedAttention-style processing:
         
-        # === PHASE 1: BUILD FULL CONTEXT KV CACHE ===
+        Phase 1 - Pass 1: Generate summaries for each block independently
+        Phase 1 - Pass 2: Build KV cache with context propagation:
+            Block 1: Block1 → KV1
+            Block 2: Summary1 + Block2 → KV2  
+            Block 3: Summary1 + Summary2 + Block3 → KV3
+            Block 4: Summary1 + Summary2 + Summary3 + Block4 → KV4
+            Final KV = concat(KV1, KV2, KV3, KV4)
+        Phase 2: Generate response
+        """
+        context_ids = self.tokenizer.encode(prompt_context, return_tensors='pt').to(self.device)
+        context_blocks = list(context_ids.split(self.block_size, dim=1))
+        num_blocks = len(context_blocks)
+        
+        print(f"\n[INFO] Context length: {context_ids.shape[1]}, Block size: {self.block_size}, Num blocks: {num_blocks}")
+        
+        # === PHASE 1, PASS 1: Generate summaries for each block ===
         with torch.no_grad():
-            print("\n--- Phase 1, Pass 1: Generating summaries... ---")
-            model_eager = self.LlamaForCausalLM.from_pretrained(
-                self.model_path, torch_dtype=torch.bfloat16, device_map='auto', attn_implementation='eager'
+            print("\n" + "="*60)
+            print("PHASE 1 - PASS 1: Generating block summaries")
+            print("="*60)
+            
+            # Load eager model using the stored class reference
+            model_eager = self._model_class.from_pretrained(
+                self.model_path, 
+                torch_dtype=torch.bfloat16, 
+                device_map='auto', 
+                attn_implementation='eager',
+                trust_remote_code=True,
             ).eval()
             
-            # Pass query_ids for query-guided k-means
-            summaries = [self._get_summary(model_eager, block, query_ids_for_guidance) for block in context_blocks]
+            summaries = []
+            for i, block in enumerate(context_blocks):
+                print(f"\n  Processing Block {i+1}/{num_blocks} (size: {block.shape[1]})")
+                summary = self._get_summary(model_eager, block)
+                summaries.append(summary)
+                print(f"    Summary size: {summary.shape[1]}")
+            
             del model_eager
             torch.cuda.empty_cache()
-            print("--- [Pass 1] All summaries generated. ---")
+            print("\n[Pass 1 Complete] All summaries generated.")
 
-            # ...existing code for Phase 1 Pass 2 and Phase 2...
-            print("\n--- Phase 1, Pass 2: Building final KV cache incrementally... ---")
+            # === PHASE 1, PASS 2: Build KV cache with context propagation ===
+            print("\n" + "="*60)
+            print("PHASE 1 - PASS 2: Building KV cache with context propagation")
+            print("="*60)
+            print("Flow:")
+            print("  Block 1: Block1")
+            print("  Block 2: Summary1 + Block2")
+            print("  Block 3: Summary1 + Summary2 + Block3")
+            print("  ...")
+            
             full_kv_cache_tuple = None
+            
             for i, block in enumerate(context_blocks):
+                # Get all summaries from PREVIOUS blocks
                 previous_summaries = summaries[:i]
+                
                 if previous_summaries:
+                    # Concatenate: [Summary1, Summary2, ..., Summary_{i-1}, Block_i]
                     augmented_input_ids = torch.cat(previous_summaries + [block], dim=1)
                     summary_len = sum(s.shape[1] for s in previous_summaries)
+                    print(f"\n  Block {i+1}: {len(previous_summaries)} summaries ({summary_len} tokens) + Block ({block.shape[1]} tokens) = {augmented_input_ids.shape[1]} total")
                 else:
+                    # First block: just the block itself
                     augmented_input_ids = block
                     summary_len = 0
+                    print(f"\n  Block {i+1}: Block only ({block.shape[1]} tokens)")
+                
+                # Forward pass to get KV cache
                 outputs = self.model_flash(augmented_input_ids, use_cache=True)
                 current_kv_cache = outputs.past_key_values
+                
+                # Slice out only the KV for the CURRENT BLOCK (not the summaries)
+                # This is the key insight: we want KV[summary_len:] which is just the block's KV
                 sliced_kv_cache = []
                 for layer_cache in current_kv_cache:
                     key, value = layer_cache
+                    # key/value shape: [bsz, num_heads, seq_len, head_dim]
                     sliced_key = key[:, :, summary_len:, :]
                     sliced_value = value[:, :, summary_len:, :]
                     sliced_kv_cache.append((sliced_key, sliced_value))
+                
+                print(f"    KV cache slice: positions [{summary_len}:{augmented_input_ids.shape[1]}] = {augmented_input_ids.shape[1] - summary_len} tokens")
+                
+                # Accumulate into full KV cache
                 if full_kv_cache_tuple is None:
                     full_kv_cache_tuple = tuple(sliced_kv_cache)
                 else:
@@ -1123,10 +1179,20 @@ class CustomAccuracyModel:
                         combined_value = torch.cat([full_value, slice_value], dim=2)
                         new_full_cache.append((combined_key, combined_value))
                     full_kv_cache_tuple = tuple(new_full_cache)
-            print("--- [Pass 2] Final KV cache for the full context is built. ---")
+                
+                del outputs, current_kv_cache
+                torch.cuda.empty_cache()
+            
+            # Report final KV cache size
+            final_kv_len = full_kv_cache_tuple[0][0].shape[2]
+            print(f"\n[Pass 2 Complete] Final KV cache length: {final_kv_len}")
+            print(f"  Original context: {context_ids.shape[1]} tokens")
+            print(f"  Compression ratio: {context_ids.shape[1] / final_kv_len:.2f}x")
 
-            # === PHASE 2: GENERATE RESPONSE ===
-            print("\n--- Phase 2: Generating response... ---")
+            # === PHASE 2: Generate response ===
+            print("\n" + "="*60)
+            print("PHASE 2: Generating response")
+            print("="*60)
             
             messages = [{"role": "user", "content": prompt_query}]
             generation_ids = self.tokenizer.apply_chat_template(
@@ -1134,19 +1200,21 @@ class CustomAccuracyModel:
             ).to(self.device)
 
             past_key_values_cache_object = DynamicCache.from_legacy_cache(full_kv_cache_tuple)
-            print(f"  [Phase 2] Step 1: Manually prefilling cache with query. (Cache len: {past_key_values_cache_object.get_seq_length()}, Query len: {generation_ids.shape[1]})")
+            print(f"  Cache length: {past_key_values_cache_object.get_seq_length()}")
+            print(f"  Query length: {generation_ids.shape[1]}")
+            
+            # Prefill with query
             outputs = self.model_flash(
                 input_ids=generation_ids,
                 past_key_values=past_key_values_cache_object,
                 use_cache=True
             )
             
-            print("  [Phase 2] Step 2: Manually generating the first token...")
+            # Generate tokens
             current_cache = outputs.past_key_values
             next_token_logits = outputs.logits[:, -1, :]
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
             
-            print("  [Phase 2] Step 3: Manually running decoding loop...")
             all_generated_ids = [next_token]
             for _ in range(self.max_new_tokens - 1):
                 outputs = self.model_flash(
@@ -1164,4 +1232,8 @@ class CustomAccuracyModel:
             generated_sequence = torch.cat(all_generated_ids, dim=1)
             final_output_ids = torch.cat([generation_ids, generated_sequence], dim=1)
             generated_text = self._get_output_text(final_output_ids, num_input_tokens=generation_ids.shape[1])
+            
+            print(f"\n[Generation Complete]")
+            print("="*60)
+            
             return {'text': [generated_text]}

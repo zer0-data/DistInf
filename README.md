@@ -1,5 +1,6 @@
 # DistInf
-Sequential Top-K attention with query-guided token selection for efficient long-context language model inference.
+
+SqueezedAttention-style token clustering and pruning for efficient long-context language model inference.
 
 ## Features
 - **Query-Guided Top-K Selection**: Select most relevant tokens from each block based on attention to query
@@ -70,7 +71,7 @@ Use K-Means clustering on token hidden states for selection with improvements:
 python run_single_sample.py \
     --model_path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --summary_method kmeans \
-    --pruning_percent 0.75 \
+    --pruning_percent 75 \
     --block_size 4096 \
     --max_new_tokens 100 \
     --dataset_config 16k \

@@ -64,15 +64,18 @@ python run_topk_single_sample.py \
 
 ### K-Means Clustering (run_single_sample.py)
 
-Use K-Means clustering on token hidden states for selection:
+Use K-Means clustering on token hidden states for selection with improvements:
 
 ```bash
 python run_single_sample.py \
     --model_path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --summary_method kmeans \
-    --k_summary_size 128 \
+    --pruning_percent 0.75 \
     --block_size 4096 \
-    --max_new_tokens 100
+    --max_new_tokens 100 \
+    --dataset_config 16k \
+    --dataset_split qa1 \
+    --sample_index 0
 ```
 
 Or use attention-based top-k selection:
@@ -92,9 +95,14 @@ python run_single_sample.py \
 |----------|---------|-------------|
 | `--model_path` | Required | HuggingFace model path |
 | `--summary_method` | "top_k" | Selection method: `top_k` or `kmeans` |
+| `--pruning_percent` | 0.1 | Percentage of tokens to prune per block (for kmeans) |
 | `--k_summary_size` | 128 | Number of tokens to select per block |
 | `--block_size` | 4096 | Size of each context block |
 | `--max_new_tokens` | 100 | Max tokens to generate |
+| `--stop_words` | "" | Comma-separated stop words |
+| `--dataset_config` | "16k" | Dataset config (16k, 32k, 64k, 128k) |
+| `--dataset_split` | "qa1" | Dataset split |
+| `--sample_index` | 0 | Sample index to test |
 
 **Note:** K-Means requires `scikit-learn`:
 ```bash

@@ -47,7 +47,13 @@ def main(args):
         max_new_tokens=args.max_new_tokens,
         block_size=args.block_size,
         k_summary_size=args.k_summary_size,
-        summary_method=args.summary_method,  # NEW: Pass the summary method
+        summary_method=args.summary_method,
+        pruning_percent=args.pruning_percent,
+        # New k-means improvement parameters
+        use_cosine_similarity=args.use_cosine_similarity,
+        multi_layer_aggregation=args.multi_layer_aggregation,
+        query_guided=args.query_guided,
+        query_weight=args.query_weight,
     )
     print("Model loaded successfully.")
 
@@ -107,6 +113,56 @@ if __name__ == '__main__':
         default='top_k',
         choices=['top_k', 'kmeans'],
         help='Method for summarizing context blocks: "top_k" (attention-based) or "kmeans" (clustering-based)'
+    )
+    parser.add_argument(
+        '--pruning_percent',
+        type=float,
+        default=90.0,
+        help='Percentage of tokens to prune (0-100). Only used with kmeans method. E.g., 90 means keep 10%% of tokens.'
+    )
+    
+    # New arguments for k-means improvements
+    parser.add_argument(
+        '--use_cosine_similarity',
+        action='store_true',
+        default=True,
+        help='Use cosine similarity instead of Euclidean distance for k-means (default: True)'
+    )
+    parser.add_argument(
+        '--no_cosine_similarity',
+        action='store_false',
+        dest='use_cosine_similarity',
+        help='Use Euclidean distance instead of cosine similarity'
+    )
+    parser.add_argument(
+        '--multi_layer_aggregation',
+        action='store_true',
+        default=True,
+        help='Aggregate hidden states from multiple layers (default: True)'
+    )
+    parser.add_argument(
+        '--no_multi_layer',
+        action='store_false',
+        dest='multi_layer_aggregation',
+        help='Use only the last layer hidden states'
+    )
+    parser.add_argument(
+        '--query_guided',
+        action='store_true',
+        default=True,
+        help='Use query-guided token selection for k-means (default: True)'
+    )
+    parser.add_argument(
+        '--no_query_guided',
+        action='store_false',
+        dest='query_guided',
+        help='Disable query-guided selection'
+    )
+    parser.add_argument(
+        '--query_weight',
+        type=float,
+        default=0.3,
+        help='Weight for query relevance in selection (0-1). Higher = more query-focused. Default: 0.3'
     )
     
     args = parser.parse_args()

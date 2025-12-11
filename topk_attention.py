@@ -70,23 +70,23 @@ class AttentionScoreAccumulator:
             # Query tokens are appended - use query attention for scoring block tokens
             query_start_idx = self.block_token_count
             
-            # Get attention FROM query tokens TO block tokens
-            query_attention = attn_weights[:, :, query_start_idx:, :]
-            
-            # Sum to get importance of each block token
-            layer_scores = query_attention[:, :, :, :self.block_token_count].sum(dim=(1, 2))
+            # Get attention FROM query tokens TO block tokens (slice, don't copy)
+            # Sum directly to minimize intermediate tensors
+            layer_scores = attn_weights[:, :, query_start_idx:, :self.block_token_count].sum(dim=(1, 2))
         else:
             # No query tokens - use all attention
             layer_scores = attn_weights.sum(dim=(1, 2))
         
         if self.accumulated_scores is None:
-            self.accumulated_scores = layer_scores.clone()
+            self.accumulated_scores = layer_scores  # No clone needed, we own this tensor
         else:
+            # In-place addition to avoid allocating new tensor
             if self.accumulated_scores.shape[-1] == layer_scores.shape[-1]:
-                self.accumulated_scores = self.accumulated_scores + layer_scores
+                self.accumulated_scores.add_(layer_scores)
             else:
                 min_len = min(self.accumulated_scores.shape[-1], layer_scores.shape[-1])
-                self.accumulated_scores[..., :min_len] += layer_scores[..., :min_len]
+                self.accumulated_scores[..., :min_len].add_(layer_scores[..., :min_len])
+            del layer_scores  # Explicitly free
         
         self.layer_count += 1
     
@@ -222,12 +222,12 @@ class SequentialTopKProcessor:
         self,
         block_ids: torch.Tensor,
         query_ids: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         """
         Phase 1: Sample top-K tokens from a block using query-guided selection.
         
         Input: Block + Query
-        Output: Summary (top-K token IDs and their indices within the block)
+        Output: Summary (top-K token IDs)
         
         Uses memory-efficient accumulation across all layers.
         """
@@ -249,29 +249,36 @@ class SequentialTopKProcessor:
         )
         
         # Accumulate attention scores from all layers
-        for layer_idx, attn_weights in enumerate(outputs.attentions):
-            accumulator.accumulate(attn_weights, layer_idx)
+        # Process and delete each layer's attention immediately to save memory
+        attentions = outputs.attentions
+        del outputs  # Free logits and other outputs early
+        del input_ids  # Free combined input
+        
+        for layer_idx in range(len(attentions)):
+            accumulator.accumulate(attentions[layer_idx], layer_idx)
+            # Explicitly delete this layer's attention weights after processing
+            attentions[layer_idx] = None
+        
+        del attentions
+        torch.cuda.empty_cache()
         
         # Get top-K selection
         selected_indices = accumulator.select_top_k(self.top_k)
         
         # Clean up
         accumulator.finish_block()
-        del outputs
-        torch.cuda.empty_cache()
         
         if not selected_indices:
             # Fallback: take first K tokens
             k = min(self.top_k, block_len)
             selected_indices = list(range(k))
         
-        # Convert to tensor
+        # Convert to tensor and index directly (avoid storing indices separately)
         indices_tensor = torch.tensor(selected_indices, device=self.device, dtype=torch.long)
-        
-        # Get the actual token IDs for the summary
         summary_ids = block_ids[:, indices_tensor]
+        del indices_tensor  # Free immediately
         
-        return summary_ids, indices_tensor
+        return summary_ids
     
     @torch.no_grad()
     def _build_kv_cache_sequential(
@@ -309,13 +316,23 @@ class SequentialTopKProcessor:
             # Store the full KV cache from this step
             all_kv_caches.append(outputs.past_key_values)
             
+            del outputs.logits  # Free logits immediately (large tensor)
             del outputs
+            if i > 0:
+                del input_ids  # Free concatenated input
             torch.cuda.empty_cache()
             
-            print(f"  Step {i+1}: Input length {input_ids.shape[1]} → KV cache built")
+            print(f"  Step {i+1}: Input length {input_ids.shape[1] if i == 0 else 'freed'} → KV cache built")
         
-        # Concatenate all KV caches
+        # Concatenate all KV caches and free individual caches
         final_kv_cache = self._concatenate_kv_caches(all_kv_caches)
+        
+        # Free individual caches after concatenation
+        for cache in all_kv_caches:
+            for layer_kv in cache:
+                del layer_kv
+        del all_kv_caches
+        torch.cuda.empty_cache()
         
         return final_kv_cache
     
@@ -328,11 +345,15 @@ class SequentialTopKProcessor:
         combined_cache = []
         
         for layer_idx in range(num_layers):
+            # Collect keys and values for this layer
             all_keys = [cache[layer_idx][0] for cache in kv_caches]
             all_values = [cache[layer_idx][1] for cache in kv_caches]
             
             combined_key = torch.cat(all_keys, dim=2)
             combined_value = torch.cat(all_values, dim=2)
+            
+            # Clear references to allow GC
+            del all_keys, all_values
             
             combined_cache.append((combined_key, combined_value))
         
@@ -341,14 +362,21 @@ class SequentialTopKProcessor:
     @torch.no_grad()
     def _generate(
         self,
-        query_ids: torch.Tensor,
+        query_text: str,
         kv_cache: Tuple,
     ) -> torch.Tensor:
         """
         Phase 3: Generate response by projecting query onto sparse KV cache.
+        Uses chat template for proper formatting with instruction-tuned models.
         """
         # Get the length of the KV cache
         cache_len = kv_cache[0][0].shape[2]
+        
+        # Apply chat template to query for proper formatting
+        messages = [{"role": "user", "content": query_text}]
+        query_ids = self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, return_tensors="pt"
+        ).to(self.device)
         
         # Position IDs for query start after the cache
         position_ids = torch.arange(
@@ -431,7 +459,7 @@ class SequentialTopKProcessor:
         print(f"\n--- Phase 1: Sampling (Top-{self.top_k} per block) ---")
         summaries = []
         for i, block in enumerate(blocks):
-            summary_ids, indices = self._sample_topk_from_block(block, query_ids)
+            summary_ids = self._sample_topk_from_block(block, query_ids)
             summaries.append(summary_ids)
             print(f"  Block {i+1}: {block.shape[1]} tokens → Summary: {summary_ids.shape[1]} tokens")
         
@@ -441,9 +469,13 @@ class SequentialTopKProcessor:
         total_cache_len = kv_cache[0][0].shape[2]
         print(f"  Total KV cache length: {total_cache_len} tokens")
         
+        # Free blocks and summaries after KV cache is built
+        del blocks, summaries, context_ids, query_ids
+        torch.cuda.empty_cache()
+        
         # === PHASE 3: Generation ===
         print(f"\n--- Phase 3: Generation ---")
-        generated_ids = self._generate(query_ids, kv_cache)
+        generated_ids = self._generate(prompt_query, kv_cache)
         generated_text = self._get_output_text(generated_ids)
         
         print(f"\nGenerated {generated_ids.shape[1]} tokens")

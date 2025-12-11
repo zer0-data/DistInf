@@ -859,49 +859,44 @@ class CustomAccuracyModel:
             Hidden states tensor of shape (seq_len, hidden_dim)
         """
         with torch.no_grad():
-            # Process in chunks to manage memory
-            chunks = list(input_ids.split(self.summary_chunk_size, dim=1))
-            all_hidden_states = []
+            # Process the entire block at once to preserve context
+            outputs = model_eager(input_ids, output_hidden_states=True)
+            hidden_states_tuple = outputs.hidden_states  # (num_layers + 1,) tensors
             
-            for chunk in chunks:
-                outputs = model_eager(chunk, output_hidden_states=True)
-                hidden_states_tuple = outputs.hidden_states  # (num_layers + 1,) tensors
+            if self.multi_layer_aggregation:
+                # Aggregate from last N layers (SqueezedAttention style)
+                num_total_layers = len(hidden_states_tuple) - 1  # Exclude embedding
+                layers_to_use = min(self.num_layers_for_clustering, num_total_layers)
                 
-                if self.multi_layer_aggregation:
-                    # Aggregate from last N layers (SqueezedAttention style)
-                    num_total_layers = len(hidden_states_tuple) - 1  # Exclude embedding
-                    layers_to_use = min(self.num_layers_for_clustering, num_total_layers)
-                    
-                    # Get last N layers
-                    selected_layers = hidden_states_tuple[-layers_to_use:]
-                    
-                    # Compute weights (later layers get more weight)
-                    if self.layer_weights is None:
-                        weights = torch.tensor(
-                            [2 ** i for i in range(layers_to_use)],
-                            dtype=torch.float32,
-                            device=self.device
-                        )
-                        weights = weights / weights.sum()
-                    else:
-                        weights = torch.tensor(self.layer_weights[-layers_to_use:], device=self.device)
-                        weights = weights / weights.sum()
-                    
-                    # Weighted sum
-                    aggregated = torch.zeros_like(selected_layers[0].squeeze(0))
-                    for layer_states, weight in zip(selected_layers, weights):
-                        aggregated += weight * layer_states.squeeze(0)
-                    
-                    all_hidden_states.append(aggregated)
+                # Get last N layers
+                selected_layers = hidden_states_tuple[-layers_to_use:]
+                
+                # Compute weights (later layers get more weight)
+                if self.layer_weights is None:
+                    weights = torch.tensor(
+                        [2 ** i for i in range(layers_to_use)],
+                        dtype=torch.float32,
+                        device=self.device
+                    )
+                    weights = weights / weights.sum()
                 else:
-                    # Use only last layer
-                    last_hidden = outputs.hidden_states[-1].squeeze(0)
-                    all_hidden_states.append(last_hidden)
+                    weights = torch.tensor(self.layer_weights[-layers_to_use:], device=self.device)
+                    weights = weights / weights.sum()
                 
-                del outputs
-                torch.cuda.empty_cache()
+                # Weighted sum: shape (1, seq_len, hidden_dim) -> (seq_len, hidden_dim)
+                aggregated = torch.zeros_like(selected_layers[0].squeeze(0))
+                for layer_states, weight in zip(selected_layers, weights):
+                    aggregated += weight * layer_states.squeeze(0)
+                
+                result = aggregated
+            else:
+                # Use only last layer: shape (1, seq_len, hidden_dim) -> (seq_len, hidden_dim)
+                result = outputs.hidden_states[-1].squeeze(0)
             
-            return torch.cat(all_hidden_states, dim=0)
+            del outputs, hidden_states_tuple
+            torch.cuda.empty_cache()
+            
+            return result
 
     def _cluster_and_select_representatives(
         self,
@@ -926,22 +921,51 @@ class CustomAccuracyModel:
         if KMeans is None:
             raise RuntimeError("sklearn is required for k-means clustering")
         
+        seq_len = hidden_states.shape[0]
+        
+        # Handle edge case: if n_clusters >= seq_len, return all tokens
+        if n_clusters >= seq_len:
+            selected_indices = list(range(seq_len))
+            selected_indices_tensor = torch.tensor(selected_indices, device=input_ids.device, dtype=torch.long)
+            return input_ids[:, selected_indices_tensor], selected_indices
+        
         # Convert to numpy for sklearn
         features = hidden_states.float().cpu().numpy()
         
+        # Identify zero-norm vectors before normalization
+        norms = np.linalg.norm(features, axis=1)
+        zero_norm_mask = norms < 1e-8
+        num_zero_norm = zero_norm_mask.sum()
+        
+        if num_zero_norm > 0:
+            print(f"    [Warning] Found {num_zero_norm} zero-norm vectors")
+        
         # Normalize for cosine similarity-based clustering
         if self.use_cosine_similarity:
-            norms = np.linalg.norm(features, axis=1, keepdims=True)
-            norms = np.where(norms == 0, 1, norms)
-            features = features / norms
+            # Add small epsilon to avoid division by zero
+            norms_safe = np.where(norms < 1e-8, 1.0, norms)
+            features = features / norms_safe[:, np.newaxis]
         
-        # Run k-means
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        cluster_labels = kmeans.fit_predict(features)
-        centroids = kmeans.cluster_centers_
+        # Ensure n_clusters doesn't exceed number of unique points
+        # K-means can fail if there are fewer unique points than clusters
+        n_clusters = min(n_clusters, seq_len)
+        
+        # Run k-means with error handling
+        try:
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            cluster_labels = kmeans.fit_predict(features)
+            centroids = kmeans.cluster_centers_
+        except Exception as e:
+            print(f"    [Warning] K-means failed: {e}. Using uniform sampling fallback.")
+            # Fallback: uniformly sample n_clusters tokens
+            indices = np.linspace(0, seq_len - 1, n_clusters, dtype=int)
+            selected_indices = sorted(indices.tolist())
+            selected_indices_tensor = torch.tensor(selected_indices, device=input_ids.device, dtype=torch.long)
+            return input_ids[:, selected_indices_tensor], selected_indices
         
         # Select representative from each cluster (closest to centroid)
         selected_indices = []
+        empty_clusters = 0
         
         for cluster_id in range(n_clusters):
             # Get indices of tokens in this cluster
@@ -949,6 +973,7 @@ class CustomAccuracyModel:
             cluster_indices = np.where(cluster_mask)[0]
             
             if len(cluster_indices) == 0:
+                empty_clusters += 1
                 continue
             
             # Get features of tokens in this cluster
@@ -957,9 +982,9 @@ class CustomAccuracyModel:
             
             # Compute distance to centroid
             if self.use_cosine_similarity:
-                # Cosine distance = 1 - cosine_similarity
                 # For normalized vectors: cosine_sim = dot product
-                similarities = cluster_features @ centroid
+                # Handle potential numerical issues
+                similarities = np.clip(cluster_features @ centroid, -1.0, 1.0)
                 distances = 1 - similarities
             else:
                 distances = np.linalg.norm(cluster_features - centroid, axis=1)
@@ -969,8 +994,25 @@ class CustomAccuracyModel:
             global_idx = cluster_indices[best_idx_in_cluster]
             selected_indices.append(int(global_idx))
         
+        if empty_clusters > 0:
+            print(f"    [Warning] {empty_clusters} empty clusters detected")
+            
+            # Compensate for empty clusters by adding more tokens
+            # Select tokens that are furthest from any selected token
+            if len(selected_indices) < n_clusters:
+                remaining_needed = n_clusters - len(selected_indices)
+                all_indices = set(range(seq_len))
+                available_indices = list(all_indices - set(selected_indices))
+                
+                if available_indices and remaining_needed > 0:
+                    # Add tokens uniformly from available indices
+                    step = max(1, len(available_indices) // remaining_needed)
+                    additional = available_indices[::step][:remaining_needed]
+                    selected_indices.extend(additional)
+                    print(f"    [Info] Added {len(additional)} tokens to compensate for empty clusters")
+        
         # Sort to maintain original sequence order (important for positional encoding)
-        selected_indices.sort()
+        selected_indices = sorted(set(selected_indices))  # Remove duplicates and sort
         
         # Extract selected token IDs
         selected_indices_tensor = torch.tensor(selected_indices, device=input_ids.device, dtype=torch.long)

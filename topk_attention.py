@@ -1,7 +1,3 @@
-# topk_attention.py
-# Sequential Top-K attention with query-guided token selection
-# Memory-efficient: accumulates attention scores layer-by-layer
-
 from typing import Optional, Tuple, List, Dict
 
 import torch

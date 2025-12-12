@@ -358,17 +358,33 @@ class SequentialTopKProcessor:
         prefix_summaries: List[torch.Tensor],
         block_ids: torch.Tensor,
         query_ids: torch.Tensor,
-    ) -> torch.Tensor:
+        block_start_position: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Phase 1: Sample top-K tokens from a block using query-guided selection with context.
         
         Input: [Summary1 + ... + Summary_{i-1}] + Block_i + Query
-        Output: Summary_i (top-K token IDs from Block_i only)
+        Output: (Summary_i token IDs, Summary_i original position IDs)
         
         The attention scores are accumulated across all layers, but tokens are only
         selected from Block_i (not from prefix summaries or query).
         
+        Returns original position IDs so that when building KV cache, summary tokens
+        can be placed at their correct positions in the attention matrix.
+        
         Uses memory-efficient accumulation across all layers.
+        
+        Args:
+            prefix_summaries: List of summary token IDs from previous blocks
+            block_ids: Token IDs of the current block
+            query_ids: Query token IDs
+            block_start_position: The starting position of this block in the full context
+                                  (e.g., 0 for block1, 2048 for block2 if block_size=2048)
+        
+        Returns:
+            Tuple of (summary_ids, summary_positions):
+            - summary_ids: Selected token IDs shape (1, top_k)
+            - summary_positions: Original position IDs shape (1, top_k)
         
         Raises:
             ValueError: If inputs have invalid shapes or dimensions
@@ -382,6 +398,8 @@ class SequentialTopKProcessor:
             raise ValueError("block_ids cannot be empty")
         if query_ids.shape[1] == 0:
             raise ValueError("query_ids cannot be empty")
+        if block_start_position < 0:
+            raise ValueError(f"block_start_position cannot be negative, got {block_start_position}")
         
         for i, summary in enumerate(prefix_summaries):
             if summary.dim() != 2 or summary.shape[0] != 1:
@@ -460,49 +478,91 @@ class SequentialTopKProcessor:
                 f"Check that the model's attention outputs are valid and non-empty."
             )
         
-        # Convert to tensor and index directly (avoid storing indices separately)
-        indices_tensor = torch.tensor(selected_indices, device=self.device, dtype=torch.long)
-        summary_ids = block_ids[:, indices_tensor]
-        del indices_tensor  # Free immediately
+        # Index into block_ids to get selected tokens
+        # Note: We need a tensor for GPU indexing. torch.tensor() creates a new tensor
+        # from the Python list. This is unavoidable since select_top_k returns a list
+        # (for API simplicity and explicit CPU transfer).
+        indices_tensor = torch.tensor(selected_indices, device=block_ids.device, dtype=torch.long)
+        summary_ids = block_ids.index_select(dim=1, index=indices_tensor)
         
-        return summary_ids
+        # Compute original position IDs for the selected tokens
+        # selected_indices are offsets within the block (0 to block_len-1)
+        # Original positions = block_start_position + selected_indices
+        summary_positions = (block_start_position + indices_tensor).unsqueeze(0)
+        
+        del indices_tensor
+        
+        return summary_ids, summary_positions
     
     @torch.no_grad()
     def _build_kv_cache_sequential(
         self,
         blocks: List[torch.Tensor],
         summaries: List[torch.Tensor],
+        summary_original_positions: List[torch.Tensor],
     ) -> Tuple:
         """
         Phase 2: Build KV cache sequentially with correct position IDs.
         
-        Step 1: Block1 → KV1 (positions 0 to len(Block1)-1)
-        Step 2: Summary1 + Block2 → KV2 (positions continue from where KV1 ended)
-        Step 3: Summary1 + Summary2 + Block3 → KV3 (positions continue)
-        ...
+        CRITICAL: Summary tokens must retain their ORIGINAL position IDs from their source blocks.
+        This ensures the attention matrix is constructed correctly:
         
-        Final Cache = concatenation of all KVs with continuous position IDs
+        Example with block_size=2048:
+        - Block1 (positions 0-2047) → Summary1 (subset of positions 0-2047)
+        - Block2 (positions 2048-4095) attends to Summary1 at ORIGINAL positions + Block2 at 2048-4095
+        
+        In the attention matrix for Block2:
+        - Rows: positions 2048-4095 (Block2 tokens as queries)
+        - Columns: positions 0-2047 (Summary1 at original positions) + 2048-4095 (Block2 as keys)
+        - A Summary1 token originally at position k appears in column k, NOT at a new position
+        
+        Args:
+            blocks: List of block token IDs
+            summaries: List of summary token IDs (top-K selected from each block except last)
+            summary_original_positions: List of original position IDs for each summary token
+        
+        Final Cache = concatenation of all KVs with proper position embeddings
         """
         all_kv_caches = []
-        cumulative_position = 0  # Track position offset for continuous positioning
+        
+        # Track cumulative position for block tokens (not summaries)
+        block_start_position = 0
         
         for i, block in enumerate(blocks):
+            block_len = block.shape[1]
+            
             if i == 0:
-                # First block: just process Block1
+                # First block: just process Block1 with positions 0 to len(Block1)-1
                 input_ids = block
-                seq_len = block.shape[1]
+                position_ids = torch.arange(
+                    0, block_len, device=self.device
+                ).unsqueeze(0)
+                
+                print(f"  Step {i+1}: Block1 {block_len} tokens (positions 0-{block_len-1}) → KV cache built")
             else:
                 # Subsequent blocks: Summary1 + ... + Summary_{i-1} + Block_i
+                # Summaries retain their ORIGINAL positions
+                # Block_i gets positions starting from block_start_position
+                
                 prefix_summaries = summaries[:i]
+                prefix_positions = summary_original_positions[:i]
+                
+                # Combine input IDs
                 input_ids = torch.cat(prefix_summaries + [block], dim=1)
-                seq_len = input_ids.shape[1]
-            
-            # Create position IDs starting from cumulative position
-            position_ids = torch.arange(
-                cumulative_position, 
-                cumulative_position + seq_len,
-                device=self.device
-            ).unsqueeze(0)
+                
+                # Build position IDs: [summary1_original_positions, ..., summary_{i-1}_positions, block_i_positions]
+                position_parts = list(prefix_positions) + [
+                    torch.arange(
+                        block_start_position, 
+                        block_start_position + block_len,
+                        device=self.device
+                    ).unsqueeze(0)
+                ]
+                position_ids = torch.cat(position_parts, dim=1)
+                
+                prefix_len = sum(s.shape[1] for s in prefix_summaries)
+                print(f"  Step {i+1}: {prefix_len} summary tokens + Block{i+1} {block_len} tokens "
+                      f"(block positions {block_start_position}-{block_start_position + block_len - 1}) → KV cache built")
             
             outputs = self.model(
                 input_ids=input_ids,
@@ -514,15 +574,14 @@ class SequentialTopKProcessor:
             # Store the full KV cache from this step
             all_kv_caches.append(outputs.past_key_values)
             
-            # Update cumulative position for next iteration
-            cumulative_position += seq_len
-            
-            print(f"  Step {i+1}: {seq_len} tokens (positions {cumulative_position - seq_len}-{cumulative_position - 1}) → KV cache built")
+            # Update block start position for next block
+            block_start_position += block_len
             
             del outputs.logits  # Free logits immediately (large tensor)
             del outputs
             if i > 0:
                 del input_ids  # Free concatenated input
+            del position_ids
             torch.cuda.empty_cache()
         
         # Concatenate all KV caches and free individual caches
@@ -731,34 +790,44 @@ class SequentialTopKProcessor:
         # === PHASE 1: Sequential Sampling with Context ===
         print(f"\n--- Phase 1: Sequential Sampling (Top-{self.top_k} per block) ---")
         summaries = []
+        summary_positions = []  # Store original position IDs for each summary
         num_blocks = len(blocks)
         
         # Skip sampling for the last block (its summary is not used anywhere)
         blocks_to_sample = num_blocks - 1 if num_blocks > 1 else 0
         
+        # Track block start positions for correct position ID assignment
+        block_start_position = 0
+        
         for i in range(blocks_to_sample):
             block = blocks[i]
             # Use all previous summaries as prefix context
-            summary_ids = self._sample_topk_from_block_with_context(
+            summary_ids, summary_pos = self._sample_topk_from_block_with_context(
                 prefix_summaries=summaries,  # All summaries so far
                 block_ids=block,
                 query_ids=query_ids,
+                block_start_position=block_start_position,
             )
             summaries.append(summary_ids)
+            summary_positions.append(summary_pos)
+            
             prefix_info = f"prefix={sum(s.shape[1] for s in summaries[:-1])}+" if summaries[:-1] else ""
-            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens → Summary: {summary_ids.shape[1]} tokens")
+            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens (positions {block_start_position}-{block_start_position + block.shape[1] - 1}) → Summary: {summary_ids.shape[1]} tokens")
+            
+            # Update block start position for next block
+            block_start_position += block.shape[1]
         
         if num_blocks > 1:
-            print(f"  Block {num_blocks}: {blocks[-1].shape[1]} tokens (no sampling - last block)")
+            print(f"  Block {num_blocks}: {blocks[-1].shape[1]} tokens (positions {block_start_position}-{block_start_position + blocks[-1].shape[1] - 1}) (no sampling - last block)")
         
         # === PHASE 2: Build KV Cache ===
         print(f"\n--- Phase 2: Building KV Cache (Sequential) ---")
-        kv_cache = self._build_kv_cache_sequential(blocks, summaries)
+        kv_cache = self._build_kv_cache_sequential(blocks, summaries, summary_positions)
         total_cache_len = kv_cache[0][0].shape[2]
         print(f"  Total KV cache length: {total_cache_len} tokens")
         
         # Free blocks and summaries after KV cache is built
-        del blocks, summaries, context_ids
+        del blocks, summaries, summary_positions, context_ids
         torch.cuda.empty_cache()
         
         # === PHASE 3: Generation ===

@@ -571,8 +571,27 @@ class SequentialTopKProcessor:
                 output_attentions=False,
             )
             
-            # Store the full KV cache from this step
-            all_kv_caches.append(outputs.past_key_values)
+            # Slice KV cache to retain only the current block's KVs (last block_len tokens)
+            # This avoids duplicating prefix summaries in the final concatenated cache
+            if i == 0:
+                # First block: keep the full KV cache
+                block_kv_cache = outputs.past_key_values
+            else:
+                # Subsequent blocks: slice to keep only the last block_len tokens
+                # past_key_values is a tuple of (key, value) per layer
+                # key/value shape: (bsz, num_heads, seq_len, head_dim)
+                sliced_kv = []
+                for layer_kv in outputs.past_key_values:
+                    key, value = layer_kv
+                    # Slice along the sequence dimension (dim=2) to get only block tokens
+                    sliced_key = key[:, :, -block_len:, :].clone()
+                    sliced_value = value[:, :, -block_len:, :].clone()
+                    sliced_kv.append((sliced_key, sliced_value))
+                block_kv_cache = tuple(sliced_kv)
+                del sliced_kv
+            
+            # Store only the block's KV cache (not prefix)
+            all_kv_caches.append(block_kv_cache)
             
             # Update block start position for next block
             block_start_position += block_len

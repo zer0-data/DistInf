@@ -140,44 +140,77 @@ print(result['text'][0])
 
 ### Phase 1: Sequential Query-Guided Sampling
 Process blocks sequentially with context propagation (skip last block):
-1. For Block 1: Concatenate `[Block_1] + [Query]`
-2. For Block i (i > 1): Concatenate `[Summary_1 + ... + Summary_{i-1}] + [Block_i] + [Query]`
+
+1. **For Block 1**: Input = `[Block_1] + [Query]`
+2. **For Block i (i > 1)**: Input = `[Summary_1 + ... + Summary_{i-1}] + [Block_i] + [Query]`
 3. Run forward pass with `output_attentions=True`
-4. Accumulate attention scores across **ALL layers**:
+4. **Accumulate attention scores** across ALL layers using `AttentionScoreAccumulator`:
    - Extract attention FROM query tokens TO block tokens only
+   - Uses `start_block_with_prefix()` to track prefix/block/query boundaries
    - Sum across layers, heads, and query positions
+   - Memory-efficient: only stores running sum `(bsz, block_len)`
 5. Select top-K tokens based on accumulated scores (only from current block)
-6. Output: `Summary_i` = top-K token IDs from Block_i
-7. Note: Last block is skipped (its summary is not used in Phase 2)
+6. **Return both Summary_i token IDs AND their original position indices**
+7. Track total attention score per block for importance weighting in Phase 2
+8. Note: Last block is skipped (kept in full during Phase 2)
 
 ### Phase 2: Sequential KV Cache Construction
-Process blocks sequentially with accumulated summaries:
-- Step 1: `Block1` → KV cache contains Block1
-- Step 2: `Summary1 + Block2` → KV cache contains Summary1 + Block2
-- Step 3: `Summary1 + Summary2 + Block3` → KV cache contains all
+Process blocks sequentially with correct position IDs:
+
+- **Step 1**: `Block1 (positions 0 to len-1)` → KV1
+- **Step 2**: `Summary1 (ORIGINAL positions) + Block2 (positions 2048-4095)` → slice KV2
+- **Step 3**: `Summary1 + Summary2 (ORIGINAL positions) + Block3 (positions 4096-6143)` → slice KV3
 - ...
 
-Final KV Cache = Concatenation of all step outputs
+**Position ID Alignment**: Summary tokens retain their original position IDs from their source blocks. This ensures the attention matrix is constructed correctly - a token originally at position k appears in column k.
+
+**Block-wise Importance Scaling**:
+1. Compute importance weights = `softmax(log(attention_scores))` across blocks
+2. Scale each block's **values** (not keys) by its importance weight
+3. Temperature parameter controls sharpness of the distribution
+
+Final KV Cache = Concatenation of all importance-weighted KVs
 
 ### Phase 3: Generation
-- Project query onto the final sparse KV cache
-- Autoregressive token generation
+- Query position IDs start at `cache_len` (length of final KV cache)
+- Uses `DynamicCache` for efficient autoregressive generation
+- Autoregressive token generation with early stopping on EOS
 
 ### Memory Efficiency
 
 The `AttentionScoreAccumulator` is memory-efficient because it:
-- Stores only a **running sum** of attention scores `(bsz, seq_len)`
+- Stores only a **running sum** of attention scores `(bsz, block_len)`
 - Does NOT store full attention matrices from all layers
-- Processes attention layer-by-layer during accumulation
+- Processes attention layer-by-layer during accumulation with in-place addition
+- Explicitly frees each layer's attention weights after accumulation
+
+### Key Classes
+
+| Class | Description |
+|-------|-------------|
+| `AttentionScoreAccumulator` | Memory-efficient attention score accumulation across layers |
+| `SequentialTopKProcessor` | Full pipeline: Phase 1 sampling → Phase 2 KV cache → Phase 3 generation |
+
+### Key Methods
+
+| Method | Description |
+|--------|-------------|
+| `start_block_with_prefix()` | Initialize accumulator with prefix/block/query boundaries |
+| `accumulate()` | Add attention from one layer to running sum |
+| `select_top_k()` | Select top-K tokens based on accumulated scores |
+| `_sample_topk_from_block_with_context()` | Phase 1: Sample tokens with context propagation |
+| `_build_kv_cache_sequential()` | Phase 2: Build KV cache with position alignment |
+| `_generate()` | Phase 3: Autoregressive generation |
 
 ## Project Structure
 
 ```
 DistInf/
 ├── topk_attention.py           # Sequential Top-K implementation
-│   ├── AttentionScoreAccumulator   # Memory-efficient score accumulation
-│   └── SequentialTopKProcessor     # Full pipeline
-├── model.py                    # CustomAccuracyModel (supports top_k & kmeans)
+│   ├── AttentionScoreAccumulator   # Memory-efficient score accumulation with prefix support
+│   ├── SequentialTopKProcessor     # Full pipeline with position-aware KV cache
+│   └── get_or_create_accumulator() # Utility to attach accumulator to model
+├── model.py                    # CustomAccuracyModel (supports top_k & kmeans with position tracking)
 ├── run_topk_single_sample.py   # Test script for SequentialTopKProcessor
 ├── run_single_sample.py        # Test script for CustomAccuracyModel (kmeans/top_k)
 ├── requirements.txt

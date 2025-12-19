@@ -5,31 +5,59 @@ Sequential Top-K attention with query-guided token selection for efficient long-
 - **Query-Guided Top-K Selection**: Select most relevant tokens from each block based on attention from query tokens to block tokens
 - **Memory-Efficient Accumulation**: Accumulates attention scores layer-by-layer using `AttentionScoreAccumulator` (stores only running sum, not full attention matrices)
 - **Original Position Preservation**: Summary tokens retain their original position IDs for correct attention matrix construction
-- **Block-wise Importance Scaling**: Values in KV cache are scaled by block importance weights (softmax over log-transformed attention scores)
-- **Sequential KV Cache Construction**: Builds compressed KV cache with context propagation across blocks
+- **Single-pass Sparse KV Construction**: Builds a compressed KV cache by extracting KVs for all summary tokens in a single forward pass
 
 ## Pipeline Overview
 
 ```
-Phase 1 - Sequential Sampling (with context propagation, skip last block):
+Phase 1 - Sequential Sampling (with context propagation, ALL blocks):
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Block1 + Query → Accumulate attn (query→block) → Top-K → Summary1        │
 │ Summary1 + Block2 + Query → Accumulate attn → Top-K → Summary2           │
 │ Summary1 + Summary2 + Block3 + Query → Accumulate → Top-K → Summary3     │
-│ (Block4 - skip sampling, last block kept in full)                        │
-└──────────────────────────────────────────────────────────────────────────┘
-                              ↓
-         Summary tokens retain ORIGINAL position IDs
+│ ...                                                                      │
 
-Phase 2 - Build KV Cache (Sequential with position-aware attention):
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Block1 (positions 0-2047)                                → KV1           │
-│ Summary1 (original positions) + Block2 (positions 2048-4095) → KV2       │
-│ Summary1 + Summary2 (original positions) + Block3 (4096-6143) → KV3      │
-│ Summary1 + Summary2 + Summary3 + Block4 (6144-8191)      → KV4           │
+## Batch Experiments: Run Across Multiple Context Lengths and Top-K
+
+To run `run_topk_single_sample.py` for all combinations of context lengths (16k, 32k, 64k, 128k) and top_k values (64, 128, 256), use the provided shell script:
+
+```bash
+#!/bin/bash
+
+MODEL_PATH="meta-llama/Meta-Llama-3.1-8B-Instruct"
+BLOCK_SIZE=2048
+MAX_NEW_TOKENS=100
+
+for DATASET_CONFIG in 16k 32k 64k 128k; do
+    for TOP_K in 64 128 256; do
+        echo "Running: dataset_config=$DATASET_CONFIG, top_k=$TOP_K"
+        python run_topk_single_sample.py \
+            --model_path "$MODEL_PATH" \
+            --block_size $BLOCK_SIZE \
+            --max_new_tokens $MAX_NEW_TOKENS \
+            --dataset_config $DATASET_CONFIG \
+            --top_k $TOP_K
+    done
+done
+```
+
+Save this as `run_all_topk.sh`, make it executable (`chmod +x run_all_topk.sh`), and run it in your project directory.
+
+---
+
 └──────────────────────────────────────────────────────────────────────────┘
                               ↓
-         Final KV Cache = KV1 + KV2 + KV3 + KV4 (scaled by importance weights)
+         Only summary tokens (top-K per block) are kept; all other tokens are masked out.
+         Summary tokens retain their ORIGINAL position IDs.
+
+Phase 2 - Build KV Cache (Summary tokens only):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Concatenate all summary tokens from all blocks.                          │
+│ Build the KV cache using ONLY these summary tokens and their original    │
+│ position IDs. All other tokens are excluded from the cache.              │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+    Final KV Cache = All summary tokens' K/Vs (with original position IDs)
 
 Phase 3 - Generation:
 ┌──────────────────────────────────────────────────────────────────────────┐
@@ -138,38 +166,36 @@ print(result['text'][0])
 
 ## Architecture
 
+
 ### Phase 1: Sequential Query-Guided Sampling
-Process blocks sequentially with context propagation (skip last block):
+Process ALL blocks sequentially with context propagation:
 
 1. **For Block 1**: Input = `[Block_1] + [Query]`
 2. **For Block i (i > 1)**: Input = `[Summary_1 + ... + Summary_{i-1}] + [Block_i] + [Query]`
 3. Run forward pass with `output_attentions=True`
 4. **Accumulate attention scores** across ALL layers using `AttentionScoreAccumulator`:
-   - Extract attention FROM query tokens TO block tokens only
-   - Uses `start_block_with_prefix()` to track prefix/block/query boundaries
-   - Sum across layers, heads, and query positions
-   - Memory-efficient: only stores running sum `(bsz, block_len)`
+    - Extract attention FROM query tokens TO block tokens only
+    - Uses `start_block_with_prefix()` to track prefix/block/query boundaries
+    - Sum across layers, heads, and query positions
+    - Memory-efficient: only stores running sum `(bsz, block_len)`
 5. Select top-K tokens based on accumulated scores (only from current block)
 6. **Return both Summary_i token IDs AND their original position indices**
-7. Track total attention score per block for importance weighting in Phase 2
-8. Note: Last block is skipped (kept in full during Phase 2)
+7. Store summary token IDs and their original positions for Phase 2
 
-### Phase 2: Sequential KV Cache Construction
-Process blocks sequentially with correct position IDs:
+**After Phase 1:**
+- Only the summary tokens (top-K per block) are kept; all other tokens are masked out and excluded from further processing.
+- Summary tokens retain their original position IDs from their source blocks.
 
-- **Step 1**: `Block1 (positions 0 to len-1)` → KV1
-- **Step 2**: `Summary1 (ORIGINAL positions) + Block2 (positions 2048-4095)` → slice KV2
-- **Step 3**: `Summary1 + Summary2 (ORIGINAL positions) + Block3 (positions 4096-6143)` → slice KV3
-- ...
+### Phase 2: KV Cache Construction (Summary tokens only)
+- Concatenate all summary tokens and their original position IDs.
+- Build the KV cache using ONLY these summary tokens and their original position IDs.
+- No other tokens are included in the cache.
 
-**Position ID Alignment**: Summary tokens retain their original position IDs from their source blocks. This ensures the attention matrix is constructed correctly - a token originally at position k appears in column k.
+**Benefits:**
+- Only summary tokens are included in the final cache, preserving memory and efficiency.
+- Position ID alignment is preserved: each summary token appears at its original position in the attention matrix.
 
-**Block-wise Importance Scaling**:
-1. Compute importance weights = `softmax(log(attention_scores))` across blocks
-2. Scale each block's **values** (not keys) by its importance weight
-3. Temperature parameter controls sharpness of the distribution
-
-Final KV Cache = Concatenation of all importance-weighted KVs
+Final KV Cache = KV cache built from all summary tokens (single forward pass)
 
 ### Phase 3: Generation
 - Query position IDs start at `cache_len` (length of final KV cache)
@@ -199,7 +225,7 @@ The `AttentionScoreAccumulator` is memory-efficient because it:
 | `accumulate()` | Add attention from one layer to running sum |
 | `select_top_k()` | Select top-K tokens based on accumulated scores |
 | `_sample_topk_from_block_with_context()` | Phase 1: Sample tokens with context propagation |
-| `_build_kv_cache_sequential()` | Phase 2: Build KV cache with position alignment |
+| `_build_kv_cache_sparse()` | Phase 2: Build sparse KV cache (single forward pass) |
 | `_generate()` | Phase 3: Autoregressive generation |
 
 ## Project Structure

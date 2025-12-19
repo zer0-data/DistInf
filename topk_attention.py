@@ -265,6 +265,29 @@ def get_or_create_accumulator(model) -> AttentionScoreAccumulator:
 # =============================================================================
 
 class SequentialTopKProcessor:
+    @torch.no_grad()
+    def _build_kv_cache_from_summaries(
+        self,
+        summaries: List[torch.Tensor],
+        summary_original_positions: List[torch.Tensor],
+    ) -> Tuple:
+        """
+        Build the KV cache using only the summary tokens (mask all others).
+        Concatenate all summary tokens and use their original positions for position_ids.
+        """
+        # Concatenate all summary tokens and their positions
+        all_summary_token_ids = torch.cat(summaries, dim=1)
+        all_summary_positions = torch.cat(summary_original_positions, dim=1)
+        # Prepare position_ids for the summary tokens
+        position_ids = all_summary_positions
+        # Forward pass to build the cache for summary tokens only
+        outputs = self.model(
+            input_ids=all_summary_token_ids,
+            position_ids=position_ids,
+            use_cache=True,
+            output_attentions=False,
+        )
+        return outputs.past_key_values, all_summary_token_ids, position_ids
     """
     Implements the sequential block processing pipeline with query-guided top-K selection.
     
@@ -812,15 +835,9 @@ class SequentialTopKProcessor:
         summary_positions = []  # Store original position IDs for each summary
         num_blocks = len(blocks)
         
-        # Skip sampling for the last block (its summary is not used anywhere)
-        blocks_to_sample = num_blocks - 1 if num_blocks > 1 else 0
-        
-        # Track block start positions for correct position ID assignment
+        # Sample summary tokens from ALL blocks, including the last block
         block_start_position = 0
-        
-        for i in range(blocks_to_sample):
-            block = blocks[i]
-            # Use all previous summaries as prefix context
+        for i, block in enumerate(blocks):
             summary_ids, summary_pos = self._sample_topk_from_block_with_context(
                 prefix_summaries=summaries,  # All summaries so far
                 block_ids=block,
@@ -829,35 +846,28 @@ class SequentialTopKProcessor:
             )
             summaries.append(summary_ids)
             summary_positions.append(summary_pos)
-            
             prefix_info = f"prefix={sum(s.shape[1] for s in summaries[:-1])}+" if summaries[:-1] else ""
             print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens (positions {block_start_position}-{block_start_position + block.shape[1] - 1}) → Summary: {summary_ids.shape[1]} tokens")
-            
-            # Update block start position for next block
             block_start_position += block.shape[1]
         
-        if num_blocks > 1:
-            print(f"  Block {num_blocks}: {blocks[-1].shape[1]} tokens (positions {block_start_position}-{block_start_position + blocks[-1].shape[1] - 1}) (no sampling - last block)")
-        
-        # === PHASE 2: Build KV Cache ===
-        print(f"\n--- Phase 2: Building KV Cache (Sequential) ---")
-        kv_cache = self._build_kv_cache_sequential(blocks, summaries, summary_positions)
+        # === PHASE 2: Build KV Cache (Summary tokens only) ===
+        print(f"\n--- Phase 2: Building KV Cache (Summary tokens only) ---")
+        kv_cache, all_summary_token_ids, all_summary_positions = self._build_kv_cache_from_summaries(summaries, summary_positions)
+        # Check for empty summary tokens
+        if all_summary_token_ids is None or all_summary_token_ids.numel() == 0:
+            raise RuntimeError("No summary tokens were selected after Phase 1. Cannot build KV cache or generate output. Check top_k and input data.")
         total_cache_len = kv_cache[0][0].shape[2]
-        print(f"  Total KV cache length: {total_cache_len} tokens")
-        
+        print(f"  Total KV cache length: {total_cache_len} tokens (summary tokens only)")
+
         # Free blocks and summaries after KV cache is built
         del blocks, summaries, summary_positions, context_ids
-        torch.cuda.empty_cache()
-        
+        torch.cuda.empty_cache()    
+
         # === PHASE 3: Generation ===
         print(f"\n--- Phase 3: Generation ---")
-        # Reuse the same chat-templated query_ids from Phase 1
+        # Use custom generation loop to support custom KV cache and position_ids
         generated_ids = self._generate(query_ids, kv_cache)
-        
-        del query_ids
         generated_text = self._get_output_text(generated_ids)
-        
         print(f"\nGenerated {generated_ids.shape[1]} tokens")
         print("=" * 60)
-        
         return {'text': [generated_text]}

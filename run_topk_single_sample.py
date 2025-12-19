@@ -20,6 +20,8 @@ Example:
 import argparse
 import os
 import time
+import torch # added for cuda memory management
+import gc # added for garbage collection
 from datasets import load_dataset
 
 # Import the SequentialTopKProcessor from topk_attention.py
@@ -32,13 +34,15 @@ def main(args):
     and print the results for comparison.
     """
     print("\n" + "="*60)
-    print("  Sequential Top-K Attention Single Sample Test")
+    print("  Sequential Top-K Attention Multiple Samples Test")
     print("="*60)
     print(f"\nConfiguration:")
     print(f"  - Model: {args.model_path}")
     print(f"  - Block size: {args.block_size}")
     print(f"  - Top-K: {args.top_k}")
     print(f"  - Max new tokens: {args.max_new_tokens}")
+    print(f"  - Number of samples to process: {args.num_samples}")
+    print(f"  - Starting sample index: {args.start_sample_index}")
     print("="*60)
 
     # --- 1. Load Data ---
@@ -56,27 +60,7 @@ def main(args):
         print(f"Failed to load dataset. Error: {e}")
         return
 
-    # Select the sample from the dataset
-    sample_idx = args.sample_index
-    if sample_idx >= len(ds):
-        print(f"Sample index {sample_idx} out of range. Dataset has {len(ds)} samples.")
-        return
-        
-    sample = ds[sample_idx]
-    
-    context = sample['input']
-    query = sample['question']
-    target = sample['target']
-
-    print("\n--- Sample Details ---")
-    print(f"Sample index: {sample_idx}")
-    print(f"Context length: {len(context)} characters")
-    print(f"Context (first 300 chars): {context[:300]}...")
-    print(f"Query: {query}")
-    print(f"Ground Truth Target: {target}")
-    print("-" * 40)
-
-    # --- 2. Load the SequentialTopKProcessor ---
+    # --- 2. Load the SequentialTopKProcessor (once for efficiency) ---
     print("\n--- 2. Loading SequentialTopKProcessor ---")
     
     processor = SequentialTopKProcessor(
@@ -89,45 +73,92 @@ def main(args):
     
     print("Processor loaded successfully.")
 
-    # --- 3. Run Inference on the Single Sample ---
-    print("\n--- 3. Running Inference ---")
+    # --- 3. Run Inference on Multiple Samples ---
+    print("\n--- 3. Running Inference Across Samples ---")
     
-    start_time = time.time()
+    correct_predictions = 0
+    total_processed_samples = 0
     
-    try:
-        result = processor(prompt_context=context, prompt_query=query)
-        inference_success = True
-    except Exception as e:
-        print(f"\nError during inference: {e}")
-        import traceback
-        traceback.print_exc()
-        inference_success = False
-        result = None
-    
-    end_time = time.time()
-    
-    # --- 4. Display Results ---
-    if inference_success and result is not None:
-        prediction = result.get('text', [''])[0] if isinstance(result, dict) else str(result)
+    end_index = min(args.start_sample_index + args.num_samples, len(ds))
+
+    for i in range(args.start_sample_index, end_index):
+        total_processed_samples += 1
         
-        print(f"\nInference completed in {end_time - start_time:.2f} seconds.")
+        sample_idx = i
+        if sample_idx >= len(ds):
+            print(f"Warning: Sample index {sample_idx} out of range. Stopping.")
+            break
+            
+        sample = ds[sample_idx]
+        
+        context = sample['input']
+        query = sample['question']
+        target = sample['target']
+
+        print(f"\n--- Processing Sample {sample_idx} ---")
+        print(f"Context length: {len(context)} characters")
+        print(f"Query: {query}")
+        print(f"Ground Truth Target: {target}")
+        print("-" * 40)
+        
+        start_time = time.time()
+        
+        try:
+            result = processor(prompt_context=context, prompt_query=query)
+            inference_success = True
+        except Exception as e:
+            print(f"\nError during inference for sample {sample_idx}: {e}")
+            import traceback
+            traceback.print_exc()
+            inference_success = False
+            result = None
+        
+        end_time = time.time()
+        
+        # --- 4. Display Results and Calculate Accuracy ---
+        if inference_success and result is not None:
+            prediction = result.get('text', [''])[0] if isinstance(result, dict) else str(result)
+            
+            print(f"\nInference completed in {end_time - start_time:.2f} seconds for sample {sample_idx}.")
+
+            print(f"\n[Model's Generated Answer]:\n{prediction}")
+            
+            # Simple accuracy check
+            target_lower = target.lower().strip()
+            prediction_lower = prediction.lower().strip()
+            is_correct = target_lower in prediction_lower or prediction_lower in target_lower
+            
+            if is_correct:
+                correct_predictions += 1
+                print(f"\n[Match Check]: ✓ PASS")
+            else:
+                print(f"\n[Match Check]: ✗ FAIL")
+        else:
+            print(f"\nSkipping accuracy check for sample {sample_idx} due to inference error.")
 
         print("\n" + "="*60)
-        print("      FINAL RESULTS COMPARISON")
-        print("="*60)
-        print(f"\n[Query]: {query}")
-        print("\n" + "-"*40)
-        print(f"[Ground Truth Answer]:\n{target}")
-        print("\n" + "-"*40)
-        print(f"[Model's Generated Answer]:\n{prediction}")
-        print("\n" + "="*60)
         
-        # Simple accuracy check
-        target_lower = target.lower().strip()
-        prediction_lower = prediction.lower().strip()
-        is_correct = target_lower in prediction_lower or prediction_lower in target_lower
-        print(f"\n[Match Check]: {'✓ PASS' if is_correct else '✗ FAIL'}")
-        print("="*60)
+        # --- 5. Clear Memory After Each Sample ---
+        del result
+        del prediction
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            print("GPU memory cleared.")
+        print("-" * 60) # Separator for samples
+
+    # --- Final Accuracy Report ---
+    print("\n" + "="*60)
+    print("      OVERALL ACCURACY REPORT")
+    print("="*60)
+    if total_processed_samples > 0:
+        accuracy = (correct_predictions / total_processed_samples) * 100
+        print(f"Total samples processed: {total_processed_samples}")
+        print(f"Correct predictions: {correct_predictions}")
+        print(f"Accuracy: {accuracy:.2f}%")
+    else:
+        print("No samples were processed.")
+    print("="*60)
 
 
 if __name__ == '__main__':
@@ -164,7 +195,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--top_k', 
         type=int, 
-        default=256, 
+        default=128, 
         help='Number of tokens to select per block via attention accumulation'
     )
     
@@ -182,10 +213,16 @@ if __name__ == '__main__':
         help='Dataset split (e.g., "qa1", "qa2", etc.)'
     )
     parser.add_argument(
-        '--sample_index',
+        '--start_sample_index', # Renamed from sample_index
         type=int,
         default=0,
-        help='Index of the sample to test (default: 0)'
+        help='Starting index of the sample to test (default: 0)'
+    )
+    parser.add_argument(
+        '--num_samples', # New argument
+        type=int,
+        default=1000,
+        help='Number of samples to process starting from --start_sample_index (default: 1)'
     )
     
     args = parser.parse_args()

@@ -194,7 +194,7 @@ class AttentionScoreAccumulator:
         
         self.layer_count += 1
     
-    def select_top_k(self, top_k: int) -> List[int]:
+    def select_top_k(self, top_k: int) -> torch.Tensor:
         """
         Select top-K tokens based on accumulated attention scores.
         
@@ -202,7 +202,7 @@ class AttentionScoreAccumulator:
             top_k: Number of tokens to select
             
         Returns:
-            List of selected indices (sorted to maintain sequence order)
+            Tensor of selected indices (sorted to maintain sequence order, stays on device)
         
         Raises:
             ValueError: If top_k is not positive
@@ -212,7 +212,7 @@ class AttentionScoreAccumulator:
             raise ValueError(f"top_k must be positive, got {top_k}")
         
         if self.accumulated_scores is None:
-            return []
+            return torch.empty(0, dtype=torch.long, device=self.accumulated_scores.device if self.accumulated_scores is not None else None)
         
         if self.layer_count == 0:
             raise RuntimeError(
@@ -229,9 +229,8 @@ class AttentionScoreAccumulator:
         # Sort to maintain sequence order
         top_k_indices_sorted, _ = torch.sort(top_k_indices)
         
-        # Transfer to CPU and convert to Python list
-        # This is necessary because the indices will be used for Python indexing
-        return top_k_indices_sorted.cpu().tolist()
+        # Return indices as tensor (on device)
+        return top_k_indices_sorted
     
     def finish_block(self) -> None:
         """
@@ -436,13 +435,11 @@ class SequentialTopKProcessor:
         torch.cuda.empty_cache()
         selected_indices = accumulator.select_top_k(self.top_k)
         accumulator.finish_block()
-        if not selected_indices:
+        if selected_indices.numel() == 0:
             raise RuntimeError("Top-K selection returned no indices for summary+block. Check attention accumulation.")
-        indices_tensor = torch.tensor(selected_indices, device=block_ids.device, dtype=torch.long)
         new_summary_ids = torch.cat([summary_ids, block_ids], dim=1) if (summary_ids is not None and summary_ids.shape[1] > 0) else block_ids
-        new_summary_ids = new_summary_ids.index_select(dim=1, index=indices_tensor)
-        new_summary_positions = all_positions.index_select(dim=1, index=indices_tensor)
-        del indices_tensor
+        new_summary_ids = new_summary_ids.index_select(dim=1, index=selected_indices)
+        new_summary_positions = all_positions.index_select(dim=1, index=selected_indices)
         return new_summary_ids, new_summary_positions
     
     # ...existing code...
@@ -455,53 +452,51 @@ class SequentialTopKProcessor:
     ) -> torch.Tensor:
         """
         Phase 3: Generate response by projecting query onto sparse KV cache.
-        
-        Args:
-            query_ids: Pre-tokenized query (with chat template applied)
-            kv_cache: The KV cache from Phase 2
+        Uses early stopping if any stop word appears in the generated text.
         """
-        # Get the length of the KV cache
+        from transformers import StoppingCriteria, StoppingCriteriaList
+
+        class StopOnAnyStringCriteria(StoppingCriteria):
+            def __init__(self, tokenizer, stop_words, initial_length):
+                super().__init__()
+                self.tokenizer = tokenizer
+                self.stop_words = stop_words
+                self.initial_length = initial_length
+
+            def __call__(self, input_ids, scores, **kwargs):
+                # Only check the newly generated part
+                text = self.tokenizer.decode(input_ids[0][self.initial_length:], skip_special_tokens=True)
+                for stop_word in self.stop_words:
+                    if stop_word and stop_word in text:
+                        return True
+                return False
+
         cache_len = kv_cache[0][0].shape[2]
-        
-        # Position IDs for query start after the cache
         position_ids = torch.arange(
             cache_len, cache_len + query_ids.shape[1], device=self.device
         ).unsqueeze(0)
-        
-        # Convert to DynamicCache
         past_key_values = DynamicCache.from_legacy_cache(kv_cache)
-        
-        # Prefill with query
-        outputs = self.model(
+
+        stopping_criteria = None
+        if self.stop_words:
+            stopping_criteria = StoppingCriteriaList([
+                StopOnAnyStringCriteria(self.tokenizer, self.stop_words, query_ids.shape[1])
+            ])
+
+        # Use generate for efficient early stopping
+        outputs = self.model.generate(
             input_ids=query_ids,
             position_ids=position_ids,
             past_key_values=past_key_values,
+            max_new_tokens=self.max_new_tokens,
+            stopping_criteria=stopping_criteria,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
             use_cache=True,
+            do_sample=False,
         )
-        
-        current_cache = outputs.past_key_values
-        next_token_logits = outputs.logits[:, -1, :]
-        next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-        
-        generated_tokens = [next_token]
-        
-        # Autoregressive generation
-        for _ in range(self.max_new_tokens - 1):
-            outputs = self.model(
-                input_ids=next_token,
-                past_key_values=current_cache,
-                use_cache=True,
-            )
-            
-            current_cache = outputs.past_key_values
-            next_token_logits = outputs.logits[:, -1, :]
-            next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
-            generated_tokens.append(next_token)
-            
-            if next_token.item() == self.tokenizer.eos_token_id:
-                break
-        
-        return torch.cat(generated_tokens, dim=1)
+        # Only return the newly generated tokens (not the prompt)
+        return outputs[:, query_ids.shape[1]:]
     
     def _get_output_text(self, token_ids: torch.Tensor) -> str:
         """Decode token IDs to text and apply stop words."""

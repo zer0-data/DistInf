@@ -2,10 +2,10 @@ torch>=2.2.0
 transformers>=4.38.0
 datasets>=2.18.0  # For babilong test dataset
 numpy>=1.26.0
-scikit-learn>=1.4.0  # For k-means summarization (optional)
 tqdm>=4.66.0
 accelerate>=0.27.0
+scikit-learn>=1.4.0  # Required for k-means summarization (run_single_sample.py)
 
-# Note: flash-attn requires specific CUDA setup and is best installed manually
-# pip install flash-attn --no-build-isolation
+# Optional: For flash attention support in some components
+# Install with: pip install flash-attn --no-build-isolation
 flash-attn>=2.5.0

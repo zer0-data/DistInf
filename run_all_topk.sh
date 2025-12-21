@@ -5,7 +5,7 @@ BLOCK_SIZE=2048
 MAX_NEW_TOKENS=100
 
 for DATASET_CONFIG in 16k 32k 64k 128k; do
-  for TOP_K in 64 128 256; do
+  for TOP_K in 512 1024; do
     echo "Running: dataset_config=$DATASET_CONFIG, top_k=$TOP_K"
     python run_topk_single_sample.py \
       --model_path "$MODEL_PATH" \

@@ -265,51 +265,46 @@ def get_or_create_accumulator(model) -> AttentionScoreAccumulator:
 # =============================================================================
 
 class SequentialTopKProcessor:
-    @torch.no_grad()
-    def _build_kv_cache_from_summaries(
-        self,
-        summaries: List[torch.Tensor],
-        summary_original_positions: List[torch.Tensor],
-    ) -> Tuple:
-        """
-        Build the KV cache using only the summary tokens (mask all others).
-        Concatenate all summary tokens and use their original positions for position_ids.
-        """
-        # Concatenate all summary tokens and their positions
-        all_summary_token_ids = torch.cat(summaries, dim=1)
-        all_summary_positions = torch.cat(summary_original_positions, dim=1)
-        # Prepare position_ids for the summary tokens
-        position_ids = all_summary_positions
-        # Forward pass to build the cache for summary tokens only
-        outputs = self.model(
-            input_ids=all_summary_token_ids,
-            position_ids=position_ids,
-            use_cache=True,
-            output_attentions=False,
-        )
-        return outputs.past_key_values, all_summary_token_ids, position_ids
     """
-    Implements the sequential block processing pipeline with query-guided top-K selection.
+    Implements the iterative single-summary block processing pipeline with query-guided top-K selection.
     
     Pipeline:
-    Phase 1 - Sequential Sampling (with context propagation):
+    Phase 1 - Iterative Summary Update:
         Block1 + Query → Select Top-K from Block1 → Summary1
-        Summary1 + Block2 + Query → Select Top-K from Block2 → Summary2
-        Summary1 + Summary2 + Block3 + Query → Select Top-K from Block3 → Summary3
-        ... (skip last block - its summary is not used)
-    
-    Phase 2 - Build KV Cache (Sequential):
-        Block1 → KV1
-        Summary1 + Block2 → KV2 (full)
-        Summary1 + Summary2 + Block3 → KV3 (full)
+        Summary1 + Block2 + Query → Select Top-K from (Summary1 + Block2) → Summary2
+        Summary2 + Block3 + Query → Select Top-K from (Summary2 + Block3) → Summary3
         ...
-        Final Cache = KV1 + KV2 + KV3 + ...
+        At each step, only K summary tokens are retained for the next step.
+    
+    Phase 2 - Build KV Cache:
+        Final summary tokens (K) → Build sparse KV cache (single forward pass)
     
     Phase 3 - Generation:
-        Query → Attend to Final Cache → Generate
+        Query → Attend to Final Summary KV Cache → Generate
     
     Uses memory-efficient attention score accumulation (layer-by-layer).
     """
+    @torch.no_grad()
+    def _build_kv_cache_from_summary(
+        self,
+        summary_ids: torch.Tensor,
+        summary_positions: torch.Tensor,
+    ) -> Tuple:
+        """
+        Build the KV cache using only the final summary tokens (mask all others).
+        Args:
+            summary_ids: (1, k) tensor of summary token ids
+            summary_positions: (1, k) tensor of original position ids
+        Returns:
+            (kv_cache, summary_ids, summary_positions)
+        """
+        outputs = self.model(
+            input_ids=summary_ids,
+            position_ids=summary_positions,
+            use_cache=True,
+            output_attentions=False,
+        )
+        return outputs.past_key_values, summary_ids, summary_positions
     
     def __init__(
         self,
@@ -376,84 +371,45 @@ class SequentialTopKProcessor:
         return list(token_ids.split(self.block_size, dim=1))
     
     @torch.no_grad()
-    def _sample_topk_from_block_with_context(
+    def _sample_topk_from_summary_and_block(
         self,
-        prefix_summaries: List[torch.Tensor],
+        summary_ids: torch.Tensor,
+        summary_positions: torch.Tensor,
         block_ids: torch.Tensor,
-        query_ids: torch.Tensor,
         block_start_position: int,
+        query_ids: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Phase 1: Sample top-K tokens from a block using query-guided selection with context.
-        
-        Input: [Summary1 + ... + Summary_{i-1}] + Block_i + Query
-        Output: (Summary_i token IDs, Summary_i original position IDs)
-        
-        The attention scores are accumulated across all layers, but tokens are only
-        selected from Block_i (not from prefix summaries or query).
-        
-        Returns original position IDs so that when building KV cache, summary tokens
-        can be placed at their correct positions in the attention matrix.
-        
-        Uses memory-efficient accumulation across all layers.
-        
+        Iteratively update the summary: select top-K from (summary + block) using query-guided attention.
         Args:
-            prefix_summaries: List of summary token IDs from previous blocks
-            block_ids: Token IDs of the current block
-            query_ids: Query token IDs
-            block_start_position: The starting position of this block in the full context
-                                  (e.g., 0 for block1, 2048 for block2 if block_size=2048)
-        
+            summary_ids: (1, k_prev) tensor of previous summary token ids (empty for first block)
+            summary_positions: (1, k_prev) tensor of previous summary positions (empty for first block)
+            block_ids: (1, block_len) tensor of current block token ids
+            block_start_position: int, starting position of block in full context
+            query_ids: (1, q_len) tensor of query token ids
         Returns:
-            Tuple of (summary_ids, summary_positions):
-            - summary_ids: Selected token IDs shape (1, top_k)
-            - summary_positions: Original position IDs shape (1, top_k)
-        
-        Raises:
-            ValueError: If inputs have invalid shapes or dimensions
+            (summary_ids, summary_positions): both (1, k) tensors for new summary
         """
-        # Validate inputs
-        if block_ids.dim() != 2 or block_ids.shape[0] != 1:
-            raise ValueError(f"block_ids must have shape (1, seq_len), got {block_ids.shape}")
-        if query_ids.dim() != 2 or query_ids.shape[0] != 1:
-            raise ValueError(f"query_ids must have shape (1, seq_len), got {query_ids.shape}")
-        if block_ids.shape[1] == 0:
-            raise ValueError("block_ids cannot be empty")
-        if query_ids.shape[1] == 0:
-            raise ValueError("query_ids cannot be empty")
-        if block_start_position < 0:
-            raise ValueError(f"block_start_position cannot be negative, got {block_start_position}")
-        
-        for i, summary in enumerate(prefix_summaries):
-            if summary.dim() != 2 or summary.shape[0] != 1:
-                raise ValueError(f"prefix_summaries[{i}] must have shape (1, seq_len), got {summary.shape}")
-            if summary.shape[1] == 0:
-                raise ValueError(f"prefix_summaries[{i}] cannot be empty")
-        
-        block_len = block_ids.shape[1]
-        
-        if self.top_k > block_len:
-            import warnings
-            warnings.warn(
-                f"top_k ({self.top_k}) exceeds block length ({block_len}). "
-                f"Will select all {block_len} tokens from this block."
-            )
-        
-        # Compute prefix length (all summaries before this block)
-        prefix_len = sum(s.shape[1] for s in prefix_summaries) if prefix_summaries else 0
-        
-        # Combine: [prefix_summaries] + block + query
-        if prefix_summaries:
-            input_ids = torch.cat(prefix_summaries + [block_ids, query_ids], dim=1)
+        # Concatenate summary and block
+        if summary_ids is not None and summary_ids.shape[1] > 0:
+            input_ids = torch.cat([summary_ids, block_ids, query_ids], dim=1)
+            prefix_len = 0
+            block_len = summary_ids.shape[1] + block_ids.shape[1]
         else:
             input_ids = torch.cat([block_ids, query_ids], dim=1)
-        
+            prefix_len = 0
+            block_len = block_ids.shape[1]
         total_len = input_ids.shape[1]
         query_len = query_ids.shape[1]
-        
-        # Start accumulation
-        # block_token_count is set to select only from block (not prefix or query)
-        # We need to track: prefix_len, block_len, query_len
+        # Prepare position ids
+        if summary_positions is not None and summary_positions.shape[1] > 0:
+            all_positions = torch.cat([
+                summary_positions,
+                torch.arange(block_start_position, block_start_position + block_ids.shape[1], device=block_ids.device).unsqueeze(0)
+            ], dim=1)
+        else:
+            all_positions = torch.arange(block_start_position, block_start_position + block_ids.shape[1], device=block_ids.device).unsqueeze(0)
+        # Accumulate attention
         accumulator = get_or_create_accumulator(self.model)
         accumulator.start_block_with_prefix(
             total_seq_len=total_len,
@@ -461,61 +417,33 @@ class SequentialTopKProcessor:
             block_len=block_len,
             query_len=query_len,
         )
-        
-        # Forward pass with output_attentions to get attention weights
         outputs = self.model(
             input_ids=input_ids,
+            position_ids=all_positions,
             output_attentions=True,
             use_cache=False,
         )
-        
-        # Extract attentions and free other outputs immediately
-        # Note: outputs.attentions is a tuple, so we convert to list for proper cleanup
         attentions = list(outputs.attentions)
-        del outputs  # Free logits and other outputs early
-        del input_ids  # Free combined input
-        
-        # Accumulate attention scores from all layers
-        # Process and delete each layer's attention immediately to save memory
+        del outputs
+        del input_ids
         num_layers = len(attentions)
         for layer_idx in range(num_layers):
             attn_weights = attentions[layer_idx]
-            attentions[layer_idx] = None  # Remove reference from list
+            attentions[layer_idx] = None
             accumulator.accumulate(attn_weights, layer_idx)
-            del attn_weights  # Explicitly free this layer's attention weights
-        
+            del attn_weights
         del attentions
         torch.cuda.empty_cache()
-        
-        # Get top-K selection
         selected_indices = accumulator.select_top_k(self.top_k)
-        
-        # Clean up
         accumulator.finish_block()
-        
         if not selected_indices:
-            # Empty selection indicates a bug - attention accumulation failed
-            raise RuntimeError(
-                f"Top-K selection returned no indices for block with {block_len} tokens. "
-                f"This indicates a bug in attention accumulation. "
-                f"Check that the model's attention outputs are valid and non-empty."
-            )
-        
-        # Index into block_ids to get selected tokens
-        # Note: We need a tensor for GPU indexing. torch.tensor() creates a new tensor
-        # from the Python list. This is unavoidable since select_top_k returns a list
-        # (for API simplicity and explicit CPU transfer).
+            raise RuntimeError("Top-K selection returned no indices for summary+block. Check attention accumulation.")
         indices_tensor = torch.tensor(selected_indices, device=block_ids.device, dtype=torch.long)
-        summary_ids = block_ids.index_select(dim=1, index=indices_tensor)
-        
-        # Compute original position IDs for the selected tokens
-        # selected_indices are offsets within the block (0 to block_len-1)
-        # Original positions = block_start_position + selected_indices
-        summary_positions = (block_start_position + indices_tensor).unsqueeze(0)
-        
+        new_summary_ids = torch.cat([summary_ids, block_ids], dim=1) if (summary_ids is not None and summary_ids.shape[1] > 0) else block_ids
+        new_summary_ids = new_summary_ids.index_select(dim=1, index=indices_tensor)
+        new_summary_positions = all_positions.index_select(dim=1, index=indices_tensor)
         del indices_tensor
-        
-        return summary_ids, summary_positions
+        return new_summary_ids, new_summary_positions
     
     # ...existing code...
     
@@ -588,70 +516,46 @@ class SequentialTopKProcessor:
         prompt_query: str,
     ) -> Dict[str, List[str]]:
         """
-        Run the full pipeline.
-        
+        Run the full iterative single-summary pipeline.
         Args:
             prompt_context: The long context to process
             prompt_query: The query/question
-            
         Returns:
             Dict with 'text' key containing generated response
         """
         print("=" * 60)
-        print("Sequential Top-K Processing Pipeline")
-        print("=" * 60)
-        
-        # Tokenize
+        print("Iterative Single-Summary Top-K Pipeline")
+        # Tokenize context and query
         context_ids = self._tokenize(prompt_context)
-        # Use chat template for query to match Phase 3 generation format
         query_ids = self._tokenize_query_with_chat_template(prompt_query)
-        
-        print(f"\nContext length: {context_ids.shape[1]} tokens")
-        print(f"Query length: {query_ids.shape[1]} tokens (with chat template)")
-        
-        # Split context into blocks
         blocks = self._split_into_blocks(context_ids)
-        print(f"Split into {len(blocks)} blocks of ~{self.block_size} tokens each")
-        
-        # === PHASE 1: Sequential Sampling with Context ===
-        print(f"\n--- Phase 1: Sequential Sampling (Top-{self.top_k} per block) ---")
-        summaries = []
-        summary_positions = []  # Store original position IDs for each summary
-        num_blocks = len(blocks)
-        
-        # Sample summary tokens from ALL blocks, including the last block
-        block_start_position = 0
-        for i, block in enumerate(blocks):
-            summary_ids, summary_pos = self._sample_topk_from_block_with_context(
-                prefix_summaries=summaries,  # All summaries so far
-                block_ids=block,
-                query_ids=query_ids,
-                block_start_position=block_start_position,
-            )
-            summaries.append(summary_ids)
-            summary_positions.append(summary_pos)
-            prefix_info = f"prefix={sum(s.shape[1] for s in summaries[:-1])}+" if summaries[:-1] else ""
-            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens (positions {block_start_position}-{block_start_position + block.shape[1] - 1}) → Summary: {summary_ids.shape[1]} tokens")
-            block_start_position += block.shape[1]
-        
-        # === PHASE 2: Build KV Cache (Summary tokens only) ===
-        print(f"\n--- Phase 2: Building KV Cache (Summary tokens only) ---")
-        kv_cache, all_summary_token_ids, all_summary_positions = self._build_kv_cache_from_summaries(summaries, summary_positions)
-        # Check for empty summary tokens
-        if all_summary_token_ids is None or all_summary_token_ids.numel() == 0:
-            raise RuntimeError("No summary tokens were selected after Phase 1. Cannot build KV cache or generate output. Check top_k and input data.")
-        total_cache_len = kv_cache[0][0].shape[2]
-        print(f"  Total KV cache length: {total_cache_len} tokens (summary tokens only)")
-
-        # Free blocks and summaries after KV cache is built
-        del blocks, summaries, summary_positions, context_ids
-        torch.cuda.empty_cache()    
-
-        # === PHASE 3: Generation ===
-        print(f"\n--- Phase 3: Generation ---")
-        # Use custom generation loop to support custom KV cache and position_ids
-        generated_ids = self._generate(query_ids, kv_cache)
-        generated_text = self._get_output_text(generated_ids)
-        print(f"\nGenerated {generated_ids.shape[1]} tokens")
-        print("=" * 60)
-        return {'text': [generated_text]}
+        summary_ids = None
+        summary_positions = None
+        for i, block_ids in enumerate(blocks):
+            block_start = i * self.block_size
+            if i == 0:
+                # First block: summary is just from block 1
+                summary_ids, summary_positions = self._sample_topk_from_summary_and_block(
+                    summary_ids=None,
+                    summary_positions=None,
+                    block_ids=block_ids,
+                    block_start_position=block_start,
+                    query_ids=query_ids,
+                )
+            else:
+                summary_ids, summary_positions = self._sample_topk_from_summary_and_block(
+                    summary_ids=summary_ids,
+                    summary_positions=summary_positions,
+                    block_ids=block_ids,
+                    block_start_position=block_start,
+                    query_ids=query_ids,
+                )
+        # Final summary_ids, summary_positions are the K tokens for the whole context
+        kv_cache, final_summary_ids, final_summary_positions = self._build_kv_cache_from_summary(
+            summary_ids=summary_ids,
+            summary_positions=summary_positions,
+        )
+        # Generate
+        generated = self._generate(query_ids=query_ids, kv_cache=kv_cache)
+        output_text = self._get_output_text(generated)
+        return {"text": [output_text]}

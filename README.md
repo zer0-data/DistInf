@@ -10,12 +10,31 @@ Sequential Top-K attention with query-guided token selection for efficient long-
 ## Pipeline Overview
 
 ```
-Phase 1 - Sequential Sampling (with context propagation, ALL blocks):
+Phase 1 - Iterative Single-Summary Update (ALL blocks):
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Block1 + Query → Accumulate attn (query→block) → Top-K → Summary1        │
-│ Summary1 + Block2 + Query → Accumulate attn → Top-K → Summary2           │
-│ Summary1 + Summary2 + Block3 + Query → Accumulate → Top-K → Summary3     │
+│ Summary1 + Block2 + Query → Accumulate attn → Top-K from (Summary1+Block2) → Summary2 │
+│ Summary2 + Block3 + Query → Accumulate attn → Top-K from (Summary2+Block3) → Summary3 │
 │ ...                                                                      │
+│ At each step, only K summary tokens are retained for the next step.      │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+         Only summary tokens (top-K total, not per block) are kept; all other tokens are masked out.
+         Summary tokens retain their ORIGINAL position IDs.
+
+Phase 2 - Build KV Cache (Summary tokens only):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Final summary tokens (K) → Build the KV cache using ONLY these summary   │
+│ tokens and their original position IDs. All other tokens are excluded.   │
+└──────────────────────────────────────────────────────────────────────────┘
+                              ↓
+    Final KV Cache = All summary tokens' K/Vs (with original position IDs)
+
+Phase 3 - Generation:
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Query (positions start at cache_len) → Attend to Final KV Cache          │
+│                                      → Autoregressive Generation         │
+└──────────────────────────────────────────────────────────────────────────┘
 
 ## Batch Experiments: Run Across Multiple Context Lengths and Top-K
 
@@ -45,26 +64,7 @@ Save this as `run_all_topk.sh`, make it executable (`chmod +x run_all_topk.sh`),
 
 ---
 
-└──────────────────────────────────────────────────────────────────────────┘
-                              ↓
-         Only summary tokens (top-K per block) are kept; all other tokens are masked out.
-         Summary tokens retain their ORIGINAL position IDs.
 
-Phase 2 - Build KV Cache (Summary tokens only):
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Concatenate all summary tokens from all blocks.                          │
-│ Build the KV cache using ONLY these summary tokens and their original    │
-│ position IDs. All other tokens are excluded from the cache.              │
-└──────────────────────────────────────────────────────────────────────────┘
-                              ↓
-    Final KV Cache = All summary tokens' K/Vs (with original position IDs)
-
-Phase 3 - Generation:
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Query (positions start at cache_len) → Attend to Final KV Cache          │
-│                                      → Autoregressive Generation         │
-└──────────────────────────────────────────────────────────────────────────┘
-```
 
 ## Usage
 

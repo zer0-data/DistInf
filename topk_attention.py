@@ -1,7 +1,7 @@
 # topk_attention.py
 # Sequential Top-K attention with query-guided token selection
 # Memory-efficient: accumulates attention scores layer-by-layer
-# Cache construction: Anchor Tokens + Local Window + Global Top-K
+# Cache construction: Global Anchor Tokens + Local Window + Global Top-K
 
 from typing import Optional, Tuple, List, Dict
 
@@ -322,16 +322,16 @@ class SequentialTopKProcessor:
     Implements the sequential block processing pipeline with query-guided top-K selection.
     
     Cache Construction Strategy:
-        Summary = Anchor Tokens + Local Window + Global Top-K
+        Summary = Global Anchor Tokens + Local Window + Global Top-K
         
-        - Anchor Tokens: First N tokens of the block (positional anchors)
-        - Local Window: Last M tokens of the block (recent context)
+        - Global Anchor Tokens: First N tokens of the ENTIRE context (only from first block)
+        - Local Window: Last M tokens of each block (recent context)
         - Global Top-K: Top-K tokens by query attention (excluding anchor and local)
     
     Pipeline:
     Phase 1 - Sequential Sampling (with context propagation):
-        Block1 + Query → Select (Anchor + Local + Top-K) from Block1 → Summary1
-        Summary1 + Block2 + Query → Select from Block2 → Summary2
+        Block1 + Query → Select (Global Anchor + Local + Top-K) from Block1 → Summary1
+        Summary1 + Block2 + Query → Select (Local + Top-K) from Block2 → Summary2
         ...
     
     Phase 2 - Build KV Cache (Summary tokens only):
@@ -359,7 +359,7 @@ class SequentialTopKProcessor:
             block_size: Size of each context block
             max_new_tokens: Maximum tokens to generate
             stop_words: List of stop words for generation
-            anchor_size: Number of anchor tokens from the start of each block
+            anchor_size: Number of anchor tokens from the start of the entire context
             local_window_size: Number of tokens from the end of each block (local window)
         """
         from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -376,7 +376,7 @@ class SequentialTopKProcessor:
         print(f"\n[SequentialTopKProcessor] Initializing...")
         print(f"  Model: {model_path}")
         print(f"  Block Size: {block_size}")
-        print(f"  Cache Strategy: Anchor({anchor_size}) + Local({local_window_size}) + Top-K({top_k})")
+        print(f"  Cache Strategy: Global Anchor({anchor_size}) + Local({local_window_size}) + Top-K({top_k})")
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -413,22 +413,38 @@ class SequentialTopKProcessor:
         """Split token IDs into blocks of block_size."""
         return list(token_ids.split(self.block_size, dim=1))
     
-    def _compute_anchor_local_indices(self, block_len: int) -> Tuple[List[int], List[int]]:
+    def _compute_anchor_local_indices(
+        self, 
+        block_len: int, 
+        block_start_position: int,
+    ) -> Tuple[List[int], List[int]]:
         """
         Compute anchor and local window indices for a block.
         
+        Anchor tokens are the first N tokens of the ENTIRE context, not per-block.
+        So only the first block (block_start_position == 0) will have anchor tokens,
+        and only if anchor_size > 0.
+        
         Args:
             block_len: Length of the block
+            block_start_position: Starting position of this block in the full context
             
         Returns:
-            Tuple of (anchor_indices, local_indices)
+            Tuple of (anchor_indices, local_indices) - indices relative to the block
         """
-        # Anchor tokens: first anchor_size tokens
-        anchor_end = min(self.anchor_size, block_len)
-        anchor_indices = list(range(anchor_end))
+        anchor_indices = []
         
-        # Local window: last local_window_size tokens
-        # Make sure we don't overlap with anchor tokens
+        # Anchor tokens: first anchor_size tokens of the ENTIRE context
+        # These only exist in the first block (or blocks if anchor_size > block_size)
+        if block_start_position < self.anchor_size:
+            # This block contains some anchor tokens
+            # anchor tokens in this block: positions [0, min(anchor_size - block_start_position, block_len))
+            anchor_end_in_block = min(self.anchor_size - block_start_position, block_len)
+            anchor_indices = list(range(anchor_end_in_block))
+        
+        # Local window: last local_window_size tokens of this block
+        # Make sure we don't overlap with anchor tokens in this block
+        anchor_end = len(anchor_indices)
         local_start = max(anchor_end, block_len - self.local_window_size)
         local_indices = list(range(local_start, block_len))
         
@@ -445,10 +461,11 @@ class SequentialTopKProcessor:
         """
         Phase 1: Sample tokens from a block using Anchor + Local + Top-K strategy.
         
-        Cache = Anchor Tokens + Local Window + Global Top-K
+        Cache = Global Anchor Tokens + Local Window + Global Top-K
         
-        The attention scores are accumulated across all layers for Top-K selection,
-        but anchor and local window tokens are always included.
+        Global Anchor: Only from the first block(s) - first N tokens of entire context
+        Local Window: Last M tokens of this block
+        Top-K: Selected via accumulated attention scores
         
         Args:
             prefix_summaries: List of summary token IDs from previous blocks
@@ -469,8 +486,10 @@ class SequentialTopKProcessor:
         
         block_len = block_ids.shape[1]
         
-        # Compute anchor and local window indices
-        anchor_indices, local_indices = self._compute_anchor_local_indices(block_len)
+        # Compute anchor and local window indices (anchor is global, only in first block(s))
+        anchor_indices, local_indices = self._compute_anchor_local_indices(
+            block_len, block_start_position
+        )
         
         # Combine anchor and local indices (they might overlap for small blocks)
         fixed_indices_set = set(anchor_indices) | set(local_indices)
@@ -640,7 +659,7 @@ class SequentialTopKProcessor:
             Dict with 'text' key containing generated response
         """
         print("=" * 60)
-        print("Sequential Top-K Processing Pipeline (Anchor + Local + Top-K)")
+        print("Sequential Top-K Processing Pipeline (Global Anchor + Local + Top-K)")
         print("=" * 60)
         
         # Tokenize
@@ -653,7 +672,7 @@ class SequentialTopKProcessor:
         # Split context into blocks
         blocks = self._split_into_blocks(context_ids)
         print(f"Split into {len(blocks)} blocks of ~{self.block_size} tokens each")
-        print(f"Cache per block: Anchor({self.anchor_size}) + Local({self.local_window_size}) + Top-K({self.top_k})")
+        print(f"Cache strategy: Global Anchor({self.anchor_size}) + Local({self.local_window_size}/block) + Top-K({self.top_k}/block)")
         
         # === PHASE 1: Sequential Sampling with Context ===
         print(f"\n--- Phase 1: Sequential Sampling ---")
@@ -672,7 +691,8 @@ class SequentialTopKProcessor:
             summary_positions.append(summary_pos)
             
             prefix_info = f"prefix={sum(s.shape[1] for s in summaries[:-1])}+" if summaries[:-1] else ""
-            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens → Summary: {summary_ids.shape[1]} tokens (pos {block_start_position}-{block_start_position + block.shape[1] - 1})")
+            anchor_info = f" (includes global anchor)" if block_start_position < self.anchor_size else ""
+            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens → Summary: {summary_ids.shape[1]} tokens (pos {block_start_position}-{block_start_position + block.shape[1] - 1}){anchor_info}")
             block_start_position += block.shape[1]
         
         # === PHASE 2: Build KV Cache ===

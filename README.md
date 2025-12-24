@@ -1,40 +1,236 @@
-# DistInf
-Sequential Top-K attention with query-guided token selection for efficient long-context language model inference.
+
+
+
+# DistInf: Parallel Query-Guided Top-K Inference (BM25 + TF-IDF, Flash Attention 2)
+
+Efficient long-context language model inference using a parallel, query-guided summary selection pipeline with hybrid BM25 + TF-IDF scoring and Flash Attention 2 support.
+
+---
 
 ## Features
-- **Query-Guided Top-K Selection**: Select most relevant tokens from each block based on attention from query tokens to block tokens
-- **Memory-Efficient Accumulation**: Accumulates attention scores layer-by-layer using `AttentionScoreAccumulator` (stores only running sum, not full attention matrices)
-- **Original Position Preservation**: Summary tokens retain their original position IDs for correct attention matrix construction
-- **Single-pass Sparse KV Construction**: Builds a compressed KV cache by extracting KVs for all summary tokens in a single forward pass
+
+- **Hybrid BM25 + TF-IDF Scoring**: Sentences in each block are scored by a mix of BM25 (query relevance) and global TF-IDF (context importance).
+- **Parallel Block Processing**: All context blocks are processed in parallel for speed and efficiency.
+- **Anchor & Local Windows**: Always keep the first N (anchor) and last N (local) tokens in each block for context stability.
+- **Dense, Position-Aware Summary**: Selected tokens retain their original position IDs for correct RoPE/Flash Attention.
+- **Flash Attention 2 Optimized**: Dense summary tensors enable efficient use of Flash Attention 2 in HuggingFace models.
+- **Query-Guided**: The query directly influences which tokens are selected from each block.
+
+---
 
 ## Pipeline Overview
 
 ```
-Phase 1 - Iterative Single-Summary Update (ALL blocks):
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Block1 + Query → Accumulate attn (query→block) → Top-K → Summary1        │
-│ Summary1 + Block2 + Query → Accumulate attn → Top-K from (Summary1+Block2) → Summary2 │
-│ Summary2 + Block3 + Query → Accumulate attn → Top-K from (Summary2+Block3) → Summary3 │
-│ ...                                                                      │
-│ At each step, only K summary tokens are retained for the next step.      │
-└──────────────────────────────────────────────────────────────────────────┘
+Phase 1 - Parallel Block Scoring & Selection:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ For each block:                                                             │
+│   - Score sentences by (Query_BM25 * 10) + Context_TFIDF                    │
+│   - Always keep anchor tokens (first N) and local tokens (last N)           │
+│   - Select top-K tokens from highest-scoring sentences                      │
+│   - Retain original position IDs                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
                               ↓
-         Only summary tokens (top-K total, not per block) are kept; all other tokens are masked out.
-         Summary tokens retain their ORIGINAL position IDs.
+         All blocks are processed in parallel; summary tokens are concatenated.
+         Position IDs are preserved for RoPE/Flash Attention.
 
-Phase 2 - Build KV Cache (Summary tokens only):
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Final summary tokens (K) → Build the KV cache using ONLY these summary   │
-│ tokens and their original position IDs. All other tokens are excluded.   │
-└──────────────────────────────────────────────────────────────────────────┘
+Phase 2 - Build Dense KV Cache (Summary tokens only):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ All summary tokens (from all blocks) → Build the KV cache using ONLY these  │
+│ tokens and their original position IDs (single forward pass, Flash Attn 2)  │
+└─────────────────────────────────────────────────────────────────────────────┘
                               ↓
     Final KV Cache = All summary tokens' K/Vs (with original position IDs)
 
 Phase 3 - Generation:
-┌──────────────────────────────────────────────────────────────────────────┐
-│ Query (positions start at cache_len) → Attend to Final KV Cache          │
-│                                      → Autoregressive Generation         │
-└──────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Query (positions start at cache_len) → Attend to Final KV Cache             │
+│                                      → Autoregressive Generation            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Usage
+
+### Python API
+
+```python
+from topk_attention import ParallelSmartSummaryProcessor
+
+processor = ParallelSmartSummaryProcessor(
+    model_path="meta-llama/Meta-Llama-3.1-8B-Instruct",
+    top_k=256,           # Tokens to select per block
+    block_size=2048,     # Size of each context block
+    max_new_tokens=100,  # Max tokens to generate
+    anchor_size=64,      # Always keep first 64 tokens per block
+    local_window_size=64 # Always keep last 64 tokens per block
+)
+
+result = processor(
+    prompt_context="<your long context here>",
+    prompt_query="What is the main topic of the document?"
+)
+
+print(result['text'][0])
+```
+
+### CLI Example
+
+```bash
+python run_topk_single_sample.py \
+    --model_path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --top_k 256 \
+    --block_size 2048 \
+    --max_new_tokens 100 \
+    --anchor_size 64 \
+    --local_window_size 64 \
+    --sample_index 0
+```
+
+**Arguments:**
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `model_path` | Required | HuggingFace model path |
+| `top_k` | 256 | Top-K tokens to select per block (in addition to anchor/local) |
+| `block_size` | 2048 | Size of each context block |
+| `max_new_tokens` | 100 | Max tokens to generate |
+| `anchor_size` | 64 | Always keep first N tokens per block |
+| `local_window_size` | 64 | Always keep last N tokens per block |
+| `stop_words` | None | List of stop words |
+
+---
+
+## Architecture
+
+### Key Classes
+| Class | Description |
+|-------|-------------|
+| `ParallelSmartSummaryProcessor` | Implements the full pipeline: parallel block processing, hybrid BM25+TF-IDF summary selection, anchor/local token retention, dense summary construction, and Flash Attention 2 cache prefill |
+| `TextScorer` | Hybrid BM25 + TF-IDF scoring for query-guided sentence/token selection |
+
+### Key Methods
+| Method | Description |
+|--------|-------------|
+| `_sample_bm25_from_block()` | Phase 1: Block-wise sampling with anchor/local and BM25+TF-IDF scoring |
+| `_build_kv_cache()` | Phase 2: Build the KV cache using only summary tokens and their original positions |
+| `_generate()` | Phase 3: Autoregressive generation using the constructed cache |
+
+---
+
+## Project Structure
+
+```
+DistInf/
+├── topk_attention.py           # ParallelSmartSummaryProcessor (BM25+TF-IDF, Flash Attention 2)
+│   ├── TextScorer                  # Hybrid BM25 + TF-IDF scoring
+│   └── ParallelSmartSummaryProcessor # Full pipeline
+├── model.py                    # (Legacy) CustomAccuracyModel (sequential, kmeans, etc.)
+├── run_topk_single_sample.py   # CLI for ParallelSmartSummaryProcessor
+├── run_single_sample.py        # (Legacy) Sequential/kmeans pipeline
+├── requirements.txt
+└── README.md
+```
+
+---
+
+## Installation
+
+```bash
+pip install -r requirements.txt
+```
+
+**Required packages:**
+- `torch`
+- `transformers`
+- `datasets` (for running the test script)
+
+**Note**: For Flash Attention 2 support:
+```bash
+pip install flash-attn --no-build-isolation
+```
+
+---
+
+## Legacy: Sequential Top-K (TF-IDF, Per Block)
+
+The previous sequential, per-block TF-IDF pipeline is still available for reference in older scripts and classes. It is not recommended for new projects.
+
+
+
+## Features
+- **TF-IDF Top-K Summary Selection (Per Block)**: For each context block, select the most relevant tokens using TF-IDF scores computed over the block's tokens. Only block tokens are eligible for selection.
+- **Summary Token Propagation**: At each block, only the top-K summary tokens (by TF-IDF) are retained and propagated as prefix for the next block.
+- **Original Position Preservation**: Summary tokens retain their original position IDs for correct attention and cache construction.
+- **Single-Pass Sparse KV Construction**: After all blocks, builds a compressed KV cache using only the selected summary tokens and their original positions.
+
+
+
+## Pipeline Overview
+
+### Parallel Query-Guided Top-K (BM25 + TF-IDF, Flash Attention 2)
+
+```
+Phase 1 - Parallel Block Scoring & Selection:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ For each block:                                                             │
+│   - Score sentences by (Query_BM25 * 10) + Context_TFIDF                    │
+│   - Always keep anchor tokens (first N) and local tokens (last N)           │
+│   - Select top-K tokens from highest-scoring sentences                      │
+│   - Retain original position IDs                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓
+         All blocks are processed in parallel; summary tokens are concatenated.
+         Position IDs are preserved for RoPE/Flash Attention.
+
+Phase 2 - Build Dense KV Cache (Summary tokens only):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ All summary tokens (from all blocks) → Build the KV cache using ONLY these  │
+│ tokens and their original position IDs (single forward pass, Flash Attn 2)  │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓
+    Final KV Cache = All summary tokens' K/Vs (with original position IDs)
+
+Phase 3 - Generation:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Query (positions start at cache_len) → Attend to Final KV Cache             │
+│                                      → Autoregressive Generation            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### Sequential Top-K (TF-IDF, Per Block)
+
+```
+Phase 1 - Sequential TF-IDF Top-K (ALL blocks):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Block1 + Query → Select Top-K by TF-IDF → Summary1                          │
+│ Summary1 + Block2 + Query → Select Top-K by TF-IDF → Summary2               │
+│ Summary1 + Summary2 + Block3 + Query → Select Top-K by TF-IDF → Summary3    │
+│ ...                                                                         │
+│ At each step, only K summary tokens (from the current block, by TF-IDF)     │
+│ are retained and propagated as prefix for the next block.                   │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓
+         Only summary tokens (top-K per block) are kept; all other tokens are masked out.
+         Summary tokens retain their ORIGINAL position IDs.
+
+Phase 2 - Build KV Cache (Summary tokens only):
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ All summary tokens (from all blocks) → Build the KV cache using ONLY these  │
+│ tokens and their original position IDs. All other tokens are excluded.      │
+└─────────────────────────────────────────────────────────────────────────────┘
+                              ↓
+    Final KV Cache = All summary tokens' K/Vs (with original position IDs)
+
+Phase 3 - Generation:
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Query (positions start at cache_len) → Attend to Final KV Cache             │
+│                                      → Autoregressive Generation            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
 
 ## Batch Experiments: Run Across Multiple Context Lengths and Top-K
 
@@ -52,14 +248,20 @@ for DATASET_CONFIG in 16k 32k 64k 128k; do
         echo "Running: dataset_config=$DATASET_CONFIG, top_k=$TOP_K"
         python run_topk_single_sample.py \
             --model_path "$MODEL_PATH" \
-            --block_size $BLOCK_SIZE \
+            Efficient long-context language model inference using **sequential, per-block Top-K summary selection** with multiple methods (TF-IDF, RAKE, YAKE, Length-Normalized TF-IDF, TextRank).
             --max_new_tokens $MAX_NEW_TOKENS \
             --dataset_config $DATASET_CONFIG \
-            --top_k $TOP_K
-    done
-done
-```
 
+            ## Features
+            - **Flexible Top-K Summary Selection (Per Block)**: For each context block, select the most relevant tokens using one of several methods:
+                - **TF-IDF**: Standard TF-IDF score per token
+                - **RAKE**: Rapid Automatic Keyword Extraction
+                - **YAKE**: Yet Another Keyword Extractor
+                - **Length-Normalized TF-IDF**: TF-IDF score divided by token length
+                - **TextRank**: Graph-based ranking using token similarity
+            - **Summary Token Propagation**: At each block, only the top-K summary tokens (by the chosen method) are retained and propagated as prefix for the next block.
+            - **Original Position Preservation**: Summary tokens retain their original position IDs for correct attention and cache construction.
+            - **Single-Pass Sparse KV Construction**: After all blocks, builds a compressed KV cache using only the selected summary tokens and their original positions.
 Save this as `run_all_topk.sh`, make it executable (`chmod +x run_all_topk.sh`), and run it in your project directory.
 
 ---
@@ -74,6 +276,18 @@ Test on a single sample from the BABILong dataset:
 
 ```bash
 python run_topk_single_sample.py \
+            Phase 1 - Sequential Top-K (ALL blocks):
+            ┌─────────────────────────────────────────────────────────────────────────────┐
+            │ Block1 + Query → Select Top-K by <summary_method> → Summary1                │
+            │ Summary1 + Block2 + Query → Select Top-K by <summary_method> → Summary2     │
+            │ Summary1 + Summary2 + Block3 + Query → Select Top-K by <summary_method> → Summary3 │
+            │ ...                                                                         │
+            │ At each step, only K summary tokens (from the current block, by the chosen method)  │
+            │ are retained and propagated as prefix for the next block.                   │
+            └─────────────────────────────────────────────────────────────────────────────┘
+                                          ↓
+                     Only summary tokens (top-K per block) are kept; all other tokens are masked out.
+                     Summary tokens retain their ORIGINAL position IDs.
     --model_path meta-llama/Meta-Llama-3.1-8B-Instruct \
     --top_k 256 \
     --block_size 2048 \
@@ -85,12 +299,13 @@ python run_topk_single_sample.py \
 **Command Line Arguments:**
 
 | Argument | Default | Description |
+            **After Phase 1:**
+            - Only the summary tokens (top-K per block) are kept; all other tokens are masked out and excluded from further processing.
+            - Summary tokens retain their original position IDs from their source blocks.
 |----------|---------|-------------|
 | `--model_path` | Required | HuggingFace model path |
 | `--top_k` | 256 | Tokens to select per block |
 | `--block_size` | 2048 | Size of each context block |
-| `--max_new_tokens` | 100 | Max tokens to generate |
-| `--stop_words` | "" | Comma-separated stop words |
 | `--dataset_config` | "16k" | Dataset config (16k, 32k, 64k, 128k) |
 | `--dataset_split` | "qa1" | Dataset split |
 | `--sample_index` | 0 | Sample index to test |
@@ -167,28 +382,25 @@ print(result['text'][0])
 ## Architecture
 
 
-### Phase 1: Sequential Query-Guided Sampling
-Process ALL blocks sequentially with context propagation:
 
-1. **For Block 1**: Input = `[Block_1] + [Query]`
-2. **For Block i (i > 1)**: Input = `[Summary_1 + ... + Summary_{i-1}] + [Block_i] + [Query]`
-3. Run forward pass with `output_attentions=True`
-4. **Accumulate attention scores** across ALL layers using `AttentionScoreAccumulator`:
-    - Extract attention FROM query tokens TO block tokens only
-    - Uses `start_block_with_prefix()` to track prefix/block/query boundaries
-    - Sum across layers, heads, and query positions
-    - Memory-efficient: only stores running sum `(bsz, block_len)`
-5. Select top-K tokens based on accumulated scores (only from current block)
-6. **Return both Summary_i token IDs AND their original position indices**
-7. Store summary token IDs and their original positions for Phase 2
+
+### Phase 1: Sequential TF-IDF Top-K Sampling
+Process all blocks sequentially, propagating summary tokens:
+
+1. **Block 1**: Input = `[Block_1] + [Query]`
+2. **Block i (i > 1)**: Input = `[Summary_1 + ... + Summary_{i-1}] + [Block_i] + [Query]`
+3. For each block, decode block tokens to text and compute TF-IDF scores for each token (treating each token as a document).
+4. Select top-K tokens from the current block based on TF-IDF scores.
+5. Return both summary token IDs and their original position indices.
+6. Store summary token IDs and their original positions for the next block and for Phase 2.
 
 **After Phase 1:**
 - Only the summary tokens (top-K per block) are kept; all other tokens are masked out and excluded from further processing.
 - Summary tokens retain their original position IDs from their source blocks.
 
 ### Phase 2: KV Cache Construction (Summary tokens only)
-- Concatenate all summary tokens and their original position IDs.
-- Build the KV cache using ONLY these summary tokens and their original position IDs.
+- Concatenate all summary tokens and their original position IDs from all blocks.
+- Build the KV cache using ONLY these summary tokens and their original position IDs (single forward pass).
 - No other tokens are included in the cache.
 
 **Benefits:**
@@ -202,31 +414,29 @@ Final KV Cache = KV cache built from all summary tokens (single forward pass)
 - Uses `DynamicCache` for efficient autoregressive generation
 - Autoregressive token generation with early stopping on EOS
 
-### Memory Efficiency
 
-The `AttentionScoreAccumulator` is memory-efficient because it:
-- Stores only a **running sum** of attention scores `(bsz, block_len)`
-- Does NOT store full attention matrices from all layers
-- Processes attention layer-by-layer during accumulation with in-place addition
-- Explicitly frees each layer's attention weights after accumulation
+
+### Simplicity and Efficiency
+
+This approach is memory-efficient and simple:
+- No attention matrices are stored or accumulated.
+- Only TF-IDF scores are computed for each block, and top-K tokens are selected directly.
+
 
 ### Key Classes
 
 | Class | Description |
 |-------|-------------|
-| `AttentionScoreAccumulator` | Memory-efficient attention score accumulation across layers |
-| `SequentialTopKProcessor` | Full pipeline: Phase 1 sampling → Phase 2 KV cache → Phase 3 generation |
+| `SequentialTopKProcessor` | Implements the full pipeline: sequential block processing, TF-IDF-based top-K summary selection, summary propagation, and final generation |
+
 
 ### Key Methods
 
 | Method | Description |
 |--------|-------------|
-| `start_block_with_prefix()` | Initialize accumulator with prefix/block/query boundaries |
-| `accumulate()` | Add attention from one layer to running sum |
-| `select_top_k()` | Select top-K tokens based on accumulated scores |
-| `_sample_topk_from_block_with_context()` | Phase 1: Sample tokens with context propagation |
-| `_build_kv_cache_sparse()` | Phase 2: Build sparse KV cache (single forward pass) |
-| `_generate()` | Phase 3: Autoregressive generation |
+| `_sample_topk_from_block_with_context()` | Phase 1: Run block-wise sampling with context propagation and summary token selection using TF-IDF |
+| `_build_kv_cache_sequential()` | Phase 2: Build the KV cache using only summary tokens and their original positions |
+| `_generate()` | Phase 3: Autoregressive generation using the constructed cache |
 
 ## Project Structure
 

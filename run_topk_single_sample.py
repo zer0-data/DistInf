@@ -20,11 +20,10 @@ Example:
 import argparse
 import os
 import time
-import torch # added for cuda memory management
-import gc # added for garbage collection
+import torch
+import gc
 from datasets import load_dataset
 
-# Import the SequentialTopKProcessor from topk_attention.py
 from topk_attention import SequentialTopKProcessor
 
 
@@ -39,6 +38,8 @@ def main(args):
     print(f"\nConfiguration:")
     print(f"  - Model: {args.model_path}")
     print(f"  - Block size: {args.block_size}")
+    print(f"  - Anchor size: {args.anchor_size}")
+    print(f"  - Local window size: {args.local_window_size}")
     print(f"  - Top-K: {args.top_k}")
     print(f"  - Max new tokens: {args.max_new_tokens}")
     print(f"  - Number of samples to process: {args.num_samples}")
@@ -69,6 +70,8 @@ def main(args):
         block_size=args.block_size,
         max_new_tokens=args.max_new_tokens,
         stop_words=args.stop_words.split(',') if args.stop_words else None,
+        anchor_size=args.anchor_size,
+        local_window_size=args.local_window_size,
     )
     
     print("Processor loaded successfully.")
@@ -116,6 +119,7 @@ def main(args):
         end_time = time.time()
         
         # --- 4. Display Results and Calculate Accuracy ---
+        prediction = None
         if inference_success and result is not None:
             prediction = result.get('text', [''])[0] if isinstance(result, dict) else str(result)
             
@@ -140,12 +144,13 @@ def main(args):
         
         # --- 5. Clear Memory After Each Sample ---
         del result
-        del prediction
+        if prediction is not None:
+            del prediction
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             print("GPU memory cleared.")
-        print("-" * 60) # Separator for samples
+        print("-" * 60)
 
     # --- Final Accuracy Report ---
     print("\n" + "="*60)
@@ -196,7 +201,21 @@ if __name__ == '__main__':
         '--top_k', 
         type=int, 
         default=128, 
-        help='Number of tokens to select per block via attention accumulation'
+        help='Number of tokens to select per block via attention accumulation (excluding anchor/local)'
+    )
+    
+    # Anchor and Local Window arguments
+    parser.add_argument(
+        '--anchor_size',
+        type=int,
+        default=64,
+        help='Number of anchor tokens from the start of each block'
+    )
+    parser.add_argument(
+        '--local_window_size',
+        type=int,
+        default=512,
+        help='Number of tokens from the end of each block (local window)'
     )
     
     # Dataset arguments
@@ -213,16 +232,16 @@ if __name__ == '__main__':
         help='Dataset split (e.g., "qa1", "qa2", etc.)'
     )
     parser.add_argument(
-        '--start_sample_index', # Renamed from sample_index
+        '--start_sample_index',
         type=int,
         default=0,
         help='Starting index of the sample to test (default: 0)'
     )
     parser.add_argument(
-        '--num_samples', # New argument
+        '--num_samples',
         type=int,
         default=1000,
-        help='Number of samples to process starting from --start_sample_index (default: 1)'
+        help='Number of samples to process starting from --start_sample_index (default: 1000)'
     )
     
     args = parser.parse_args()

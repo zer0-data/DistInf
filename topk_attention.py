@@ -1,6 +1,7 @@
 # topk_attention.py
 # Sequential Top-K attention with query-guided token selection
 # Memory-efficient: accumulates attention scores layer-by-layer
+# Cache construction: Anchor Tokens + Local Window + Global Top-K
 
 from typing import Optional, Tuple, List, Dict
 
@@ -233,6 +234,58 @@ class AttentionScoreAccumulator:
         # This is necessary because the indices will be used for Python indexing
         return top_k_indices_sorted.cpu().tolist()
     
+    def select_top_k_with_exclusion(self, top_k: int, exclude_indices: List[int]) -> List[int]:
+        """
+        Select top-K tokens based on accumulated attention scores, excluding specified indices.
+        
+        Args:
+            top_k: Number of tokens to select
+            exclude_indices: Indices to exclude from selection (e.g., anchor and local window tokens)
+            
+        Returns:
+            List of selected indices (sorted to maintain sequence order)
+        
+        Raises:
+            ValueError: If top_k is not positive
+            RuntimeError: If no layers have been accumulated
+        """
+        if top_k <= 0:
+            return []
+        
+        if self.accumulated_scores is None:
+            return []
+        
+        if self.layer_count == 0:
+            raise RuntimeError(
+                "select_top_k_with_exclusion called but no layers have been accumulated. "
+                "Make sure accumulate() was called for each layer."
+            )
+        
+        num_block_tokens = self.accumulated_scores.shape[-1]
+        
+        # Create a mask for excluded indices
+        scores = self.accumulated_scores[0].clone()
+        if exclude_indices:
+            exclude_tensor = torch.tensor(exclude_indices, device=scores.device, dtype=torch.long)
+            # Set excluded indices to -inf so they won't be selected
+            scores[exclude_tensor] = float('-inf')
+        
+        # Count available tokens (not excluded)
+        available_tokens = num_block_tokens - len(exclude_indices)
+        token_budget = min(available_tokens, top_k)
+        
+        if token_budget <= 0:
+            return []
+        
+        # Select top-K indices from non-excluded tokens
+        _, top_k_indices = torch.topk(scores, k=token_budget)
+        
+        # Sort to maintain sequence order
+        top_k_indices_sorted, _ = torch.sort(top_k_indices)
+        
+        # Transfer to CPU and convert to Python list
+        return top_k_indices_sorted.cpu().tolist()
+    
     def finish_block(self) -> None:
         """
         Clean up after finishing a block.
@@ -265,50 +318,27 @@ def get_or_create_accumulator(model) -> AttentionScoreAccumulator:
 # =============================================================================
 
 class SequentialTopKProcessor:
-    @torch.no_grad()
-    def _build_kv_cache_from_summaries(
-        self,
-        summaries: List[torch.Tensor],
-        summary_original_positions: List[torch.Tensor],
-    ) -> Tuple:
-        """
-        Build the KV cache using only the summary tokens (mask all others).
-        Concatenate all summary tokens and use their original positions for position_ids.
-        """
-        # Concatenate all summary tokens and their positions
-        all_summary_token_ids = torch.cat(summaries, dim=1)
-        all_summary_positions = torch.cat(summary_original_positions, dim=1)
-        # Prepare position_ids for the summary tokens
-        position_ids = all_summary_positions
-        # Forward pass to build the cache for summary tokens only
-        outputs = self.model(
-            input_ids=all_summary_token_ids,
-            position_ids=position_ids,
-            use_cache=True,
-            output_attentions=False,
-        )
-        return outputs.past_key_values, all_summary_token_ids, position_ids
     """
     Implements the sequential block processing pipeline with query-guided top-K selection.
     
+    Cache Construction Strategy:
+        Summary = Anchor Tokens + Local Window + Global Top-K
+        
+        - Anchor Tokens: First N tokens of the block (positional anchors)
+        - Local Window: Last M tokens of the block (recent context)
+        - Global Top-K: Top-K tokens by query attention (excluding anchor and local)
+    
     Pipeline:
     Phase 1 - Sequential Sampling (with context propagation):
-        Block1 + Query → Select Top-K from Block1 → Summary1
-        Summary1 + Block2 + Query → Select Top-K from Block2 → Summary2
-        Summary1 + Summary2 + Block3 + Query → Select Top-K from Block3 → Summary3
-        ... (skip last block - its summary is not used)
-    
-    Phase 2 - Build KV Cache (Sequential):
-        Block1 → KV1
-        Summary1 + Block2 → KV2 (full)
-        Summary1 + Summary2 + Block3 → KV3 (full)
+        Block1 + Query → Select (Anchor + Local + Top-K) from Block1 → Summary1
+        Summary1 + Block2 + Query → Select from Block2 → Summary2
         ...
-        Final Cache = KV1 + KV2 + KV3 + ...
+    
+    Phase 2 - Build KV Cache (Summary tokens only):
+        Concatenate all summaries with their original positions
     
     Phase 3 - Generation:
         Query → Attend to Final Cache → Generate
-    
-    Uses memory-efficient attention score accumulation (layer-by-layer).
     """
     
     def __init__(
@@ -318,14 +348,19 @@ class SequentialTopKProcessor:
         block_size: int = 2048,
         max_new_tokens: int = 100,
         stop_words: Optional[List[str]] = None,
+        # New parameters for Anchor + Local + Top-K strategy
+        anchor_size: int = 64,
+        local_window_size: int = 64,
     ):
         """
         Args:
             model_path: Path to the HuggingFace model
-            top_k: Number of tokens to select from each block
+            top_k: Number of tokens to select via attention (excluding anchor and local)
             block_size: Size of each context block
             max_new_tokens: Maximum tokens to generate
             stop_words: List of stop words for generation
+            anchor_size: Number of anchor tokens from the start of each block
+            local_window_size: Number of tokens from the end of each block (local window)
         """
         from transformers import AutoTokenizer, AutoModelForCausalLM
         
@@ -334,11 +369,14 @@ class SequentialTopKProcessor:
         self.block_size = block_size
         self.max_new_tokens = max_new_tokens
         self.stop_words = stop_words or []
+        self.anchor_size = anchor_size
+        self.local_window_size = local_window_size
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         
         print(f"\n[SequentialTopKProcessor] Initializing...")
         print(f"  Model: {model_path}")
-        print(f"  Top-K: {top_k}, Block Size: {block_size}")
+        print(f"  Block Size: {block_size}")
+        print(f"  Cache Strategy: Anchor({anchor_size}) + Local({local_window_size}) + Top-K({top_k})")
         
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -375,6 +413,27 @@ class SequentialTopKProcessor:
         """Split token IDs into blocks of block_size."""
         return list(token_ids.split(self.block_size, dim=1))
     
+    def _compute_anchor_local_indices(self, block_len: int) -> Tuple[List[int], List[int]]:
+        """
+        Compute anchor and local window indices for a block.
+        
+        Args:
+            block_len: Length of the block
+            
+        Returns:
+            Tuple of (anchor_indices, local_indices)
+        """
+        # Anchor tokens: first anchor_size tokens
+        anchor_end = min(self.anchor_size, block_len)
+        anchor_indices = list(range(anchor_end))
+        
+        # Local window: last local_window_size tokens
+        # Make sure we don't overlap with anchor tokens
+        local_start = max(anchor_end, block_len - self.local_window_size)
+        local_indices = list(range(local_start, block_len))
+        
+        return anchor_indices, local_indices
+    
     @torch.no_grad()
     def _sample_topk_from_block_with_context(
         self,
@@ -384,62 +443,40 @@ class SequentialTopKProcessor:
         block_start_position: int,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Phase 1: Sample top-K tokens from a block using query-guided selection with context.
+        Phase 1: Sample tokens from a block using Anchor + Local + Top-K strategy.
         
-        Input: [Summary1 + ... + Summary_{i-1}] + Block_i + Query
-        Output: (Summary_i token IDs, Summary_i original position IDs)
+        Cache = Anchor Tokens + Local Window + Global Top-K
         
-        The attention scores are accumulated across all layers, but tokens are only
-        selected from Block_i (not from prefix summaries or query).
-        
-        Returns original position IDs so that when building KV cache, summary tokens
-        can be placed at their correct positions in the attention matrix.
-        
-        Uses memory-efficient accumulation across all layers.
+        The attention scores are accumulated across all layers for Top-K selection,
+        but anchor and local window tokens are always included.
         
         Args:
             prefix_summaries: List of summary token IDs from previous blocks
             block_ids: Token IDs of the current block
             query_ids: Query token IDs
             block_start_position: The starting position of this block in the full context
-                                  (e.g., 0 for block1, 2048 for block2 if block_size=2048)
         
         Returns:
             Tuple of (summary_ids, summary_positions):
-            - summary_ids: Selected token IDs shape (1, top_k)
-            - summary_positions: Original position IDs shape (1, top_k)
-        
-        Raises:
-            ValueError: If inputs have invalid shapes or dimensions
+            - summary_ids: Selected token IDs shape (1, num_selected)
+            - summary_positions: Original position IDs shape (1, num_selected)
         """
         # Validate inputs
         if block_ids.dim() != 2 or block_ids.shape[0] != 1:
             raise ValueError(f"block_ids must have shape (1, seq_len), got {block_ids.shape}")
         if query_ids.dim() != 2 or query_ids.shape[0] != 1:
             raise ValueError(f"query_ids must have shape (1, seq_len), got {query_ids.shape}")
-        if block_ids.shape[1] == 0:
-            raise ValueError("block_ids cannot be empty")
-        if query_ids.shape[1] == 0:
-            raise ValueError("query_ids cannot be empty")
-        if block_start_position < 0:
-            raise ValueError(f"block_start_position cannot be negative, got {block_start_position}")
-        
-        for i, summary in enumerate(prefix_summaries):
-            if summary.dim() != 2 or summary.shape[0] != 1:
-                raise ValueError(f"prefix_summaries[{i}] must have shape (1, seq_len), got {summary.shape}")
-            if summary.shape[1] == 0:
-                raise ValueError(f"prefix_summaries[{i}] cannot be empty")
         
         block_len = block_ids.shape[1]
         
-        if self.top_k > block_len:
-            import warnings
-            warnings.warn(
-                f"top_k ({self.top_k}) exceeds block length ({block_len}). "
-                f"Will select all {block_len} tokens from this block."
-            )
+        # Compute anchor and local window indices
+        anchor_indices, local_indices = self._compute_anchor_local_indices(block_len)
         
-        # Compute prefix length (all summaries before this block)
+        # Combine anchor and local indices (they might overlap for small blocks)
+        fixed_indices_set = set(anchor_indices) | set(local_indices)
+        fixed_indices = sorted(list(fixed_indices_set))
+        
+        # Compute prefix length
         prefix_len = sum(s.shape[1] for s in prefix_summaries) if prefix_summaries else 0
         
         # Combine: [prefix_summaries] + block + query
@@ -451,9 +488,7 @@ class SequentialTopKProcessor:
         total_len = input_ids.shape[1]
         query_len = query_ids.shape[1]
         
-        # Start accumulation
-        # block_token_count is set to select only from block (not prefix or query)
-        # We need to track: prefix_len, block_len, query_len
+        # Start accumulation for Top-K selection
         accumulator = get_or_create_accumulator(self.model)
         accumulator.start_block_with_prefix(
             total_seq_len=total_len,
@@ -470,54 +505,70 @@ class SequentialTopKProcessor:
         )
         
         # Extract attentions and free other outputs immediately
-        # Note: outputs.attentions is a tuple, so we convert to list for proper cleanup
         attentions = list(outputs.attentions)
-        del outputs  # Free logits and other outputs early
-        del input_ids  # Free combined input
+        del outputs
+        del input_ids
         
         # Accumulate attention scores from all layers
-        # Process and delete each layer's attention immediately to save memory
         num_layers = len(attentions)
         for layer_idx in range(num_layers):
             attn_weights = attentions[layer_idx]
-            attentions[layer_idx] = None  # Remove reference from list
+            attentions[layer_idx] = None
             accumulator.accumulate(attn_weights, layer_idx)
-            del attn_weights  # Explicitly free this layer's attention weights
+            del attn_weights
         
         del attentions
         torch.cuda.empty_cache()
         
-        # Get top-K selection
-        selected_indices = accumulator.select_top_k(self.top_k)
+        # Get Top-K selection excluding anchor and local indices
+        topk_indices = accumulator.select_top_k_with_exclusion(self.top_k, fixed_indices)
         
-        # Clean up
+        # Clean up accumulator
         accumulator.finish_block()
         
-        if not selected_indices:
-            # Empty selection indicates a bug - attention accumulation failed
+        # Combine all indices: anchor + local + top-k (sorted)
+        all_indices_set = set(fixed_indices) | set(topk_indices)
+        all_selected_indices = sorted(list(all_indices_set))
+        
+        if not all_selected_indices:
             raise RuntimeError(
-                f"Top-K selection returned no indices for block with {block_len} tokens. "
-                f"This indicates a bug in attention accumulation. "
-                f"Check that the model's attention outputs are valid and non-empty."
+                f"No tokens were selected for block with {block_len} tokens. "
+                f"This indicates a bug in the selection logic."
             )
         
-        # Index into block_ids to get selected tokens
-        # Note: We need a tensor for GPU indexing. torch.tensor() creates a new tensor
-        # from the Python list. This is unavoidable since select_top_k returns a list
-        # (for API simplicity and explicit CPU transfer).
-        indices_tensor = torch.tensor(selected_indices, device=block_ids.device, dtype=torch.long)
+        # Create tensor for indexing
+        indices_tensor = torch.tensor(all_selected_indices, device=block_ids.device, dtype=torch.long)
         summary_ids = block_ids.index_select(dim=1, index=indices_tensor)
         
-        # Compute original position IDs for the selected tokens
-        # selected_indices are offsets within the block (0 to block_len-1)
-        # Original positions = block_start_position + selected_indices
+        # Compute original position IDs
         summary_positions = (block_start_position + indices_tensor).unsqueeze(0)
         
         del indices_tensor
         
         return summary_ids, summary_positions
     
-    # ...existing code...
+    @torch.no_grad()
+    def _build_kv_cache_from_summaries(
+        self,
+        summaries: List[torch.Tensor],
+        summary_original_positions: List[torch.Tensor],
+    ) -> Tuple:
+        """
+        Build the KV cache using only the summary tokens.
+        Concatenate all summary tokens and use their original positions for position_ids.
+        """
+        # Concatenate all summary tokens and their positions
+        all_summary_token_ids = torch.cat(summaries, dim=1)
+        all_summary_positions = torch.cat(summary_original_positions, dim=1)
+        
+        # Forward pass to build the cache for summary tokens only
+        outputs = self.model(
+            input_ids=all_summary_token_ids,
+            position_ids=all_summary_positions,
+            use_cache=True,
+            output_attentions=False,
+        )
+        return outputs.past_key_values, all_summary_token_ids, all_summary_positions
     
     @torch.no_grad()
     def _generate(
@@ -527,23 +578,15 @@ class SequentialTopKProcessor:
     ) -> torch.Tensor:
         """
         Phase 3: Generate response by projecting query onto sparse KV cache.
-        
-        Args:
-            query_ids: Pre-tokenized query (with chat template applied)
-            kv_cache: The KV cache from Phase 2
         """
-        # Get the length of the KV cache
         cache_len = kv_cache[0][0].shape[2]
         
-        # Position IDs for query start after the cache
         position_ids = torch.arange(
             cache_len, cache_len + query_ids.shape[1], device=self.device
         ).unsqueeze(0)
         
-        # Convert to DynamicCache
         past_key_values = DynamicCache.from_legacy_cache(kv_cache)
         
-        # Prefill with query
         outputs = self.model(
             input_ids=query_ids,
             position_ids=position_ids,
@@ -557,7 +600,6 @@ class SequentialTopKProcessor:
         
         generated_tokens = [next_token]
         
-        # Autoregressive generation
         for _ in range(self.max_new_tokens - 1):
             outputs = self.model(
                 input_ids=next_token,
@@ -598,12 +640,11 @@ class SequentialTopKProcessor:
             Dict with 'text' key containing generated response
         """
         print("=" * 60)
-        print("Sequential Top-K Processing Pipeline")
+        print("Sequential Top-K Processing Pipeline (Anchor + Local + Top-K)")
         print("=" * 60)
         
         # Tokenize
         context_ids = self._tokenize(prompt_context)
-        # Use chat template for query to match Phase 3 generation format
         query_ids = self._tokenize_query_with_chat_template(prompt_query)
         
         print(f"\nContext length: {context_ids.shape[1]} tokens")
@@ -612,46 +653,49 @@ class SequentialTopKProcessor:
         # Split context into blocks
         blocks = self._split_into_blocks(context_ids)
         print(f"Split into {len(blocks)} blocks of ~{self.block_size} tokens each")
+        print(f"Cache per block: Anchor({self.anchor_size}) + Local({self.local_window_size}) + Top-K({self.top_k})")
         
         # === PHASE 1: Sequential Sampling with Context ===
-        print(f"\n--- Phase 1: Sequential Sampling (Top-{self.top_k} per block) ---")
+        print(f"\n--- Phase 1: Sequential Sampling ---")
         summaries = []
-        summary_positions = []  # Store original position IDs for each summary
-        num_blocks = len(blocks)
+        summary_positions = []
         
-        # Sample summary tokens from ALL blocks, including the last block
         block_start_position = 0
         for i, block in enumerate(blocks):
             summary_ids, summary_pos = self._sample_topk_from_block_with_context(
-                prefix_summaries=summaries,  # All summaries so far
+                prefix_summaries=summaries,
                 block_ids=block,
                 query_ids=query_ids,
                 block_start_position=block_start_position,
             )
             summaries.append(summary_ids)
             summary_positions.append(summary_pos)
+            
             prefix_info = f"prefix={sum(s.shape[1] for s in summaries[:-1])}+" if summaries[:-1] else ""
-            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens (positions {block_start_position}-{block_start_position + block.shape[1] - 1}) → Summary: {summary_ids.shape[1]} tokens")
+            print(f"  Block {i+1}: {prefix_info}{block.shape[1]} tokens → Summary: {summary_ids.shape[1]} tokens (pos {block_start_position}-{block_start_position + block.shape[1] - 1})")
             block_start_position += block.shape[1]
         
-        # === PHASE 2: Build KV Cache (Summary tokens only) ===
+        # === PHASE 2: Build KV Cache ===
         print(f"\n--- Phase 2: Building KV Cache (Summary tokens only) ---")
-        kv_cache, all_summary_token_ids, all_summary_positions = self._build_kv_cache_from_summaries(summaries, summary_positions)
-        # Check for empty summary tokens
+        kv_cache, all_summary_token_ids, all_summary_positions = self._build_kv_cache_from_summaries(
+            summaries, summary_positions
+        )
+        
         if all_summary_token_ids is None or all_summary_token_ids.numel() == 0:
-            raise RuntimeError("No summary tokens were selected after Phase 1. Cannot build KV cache or generate output. Check top_k and input data.")
+            raise RuntimeError("No summary tokens were selected. Cannot build KV cache.")
+        
         total_cache_len = kv_cache[0][0].shape[2]
-        print(f"  Total KV cache length: {total_cache_len} tokens (summary tokens only)")
+        print(f"  Total KV cache length: {total_cache_len} tokens")
 
-        # Free blocks and summaries after KV cache is built
+        # Free blocks and summaries
         del blocks, summaries, summary_positions, context_ids
         torch.cuda.empty_cache()    
 
         # === PHASE 3: Generation ===
         print(f"\n--- Phase 3: Generation ---")
-        # Use custom generation loop to support custom KV cache and position_ids
         generated_ids = self._generate(query_ids, kv_cache)
         generated_text = self._get_output_text(generated_ids)
         print(f"\nGenerated {generated_ids.shape[1]} tokens")
         print("=" * 60)
+        
         return {'text': [generated_text]}

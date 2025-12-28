@@ -454,6 +454,7 @@ class SequentialTopKProcessor:
     def _sample_topk_from_block_with_context(
         self,
         prefix_summaries: List[torch.Tensor],
+        prefix_positions: List[torch.Tensor],
         block_ids: torch.Tensor,
         query_ids: torch.Tensor,
         block_start_position: int,
@@ -469,6 +470,7 @@ class SequentialTopKProcessor:
         
         Args:
             prefix_summaries: List of summary token IDs from previous blocks
+            prefix_positions: List of position IDs corresponding to prefix_summaries
             block_ids: Token IDs of the current block
             query_ids: Query token IDs
             block_start_position: The starting position of this block in the full context
@@ -483,6 +485,8 @@ class SequentialTopKProcessor:
             raise ValueError(f"block_ids must have shape (1, seq_len), got {block_ids.shape}")
         if query_ids.dim() != 2 or query_ids.shape[0] != 1:
             raise ValueError(f"query_ids must have shape (1, seq_len), got {query_ids.shape}")
+        if len(prefix_summaries) != len(prefix_positions):
+            raise ValueError(f"prefix_summaries and prefix_positions must have same length")
         
         block_len = block_ids.shape[1]
         
@@ -501,8 +505,35 @@ class SequentialTopKProcessor:
         # Combine: [prefix_summaries] + block + query
         if prefix_summaries:
             input_ids = torch.cat(prefix_summaries + [block_ids, query_ids], dim=1)
+            # Build position IDs: [prefix_positions] + [block_positions] + [query_positions]
+            block_position_ids = torch.arange(
+                block_start_position, 
+                block_start_position + block_len, 
+                device=block_ids.device
+            ).unsqueeze(0)
+            # Query positions continue after the end of full context
+            # Use positions after the block for query (they attend to the context)
+            query_position_ids = torch.arange(
+                block_start_position + block_len,
+                block_start_position + block_len + query_ids.shape[1],
+                device=query_ids.device
+            ).unsqueeze(0)
+            position_ids = torch.cat(prefix_positions + [block_position_ids, query_position_ids], dim=1)
         else:
             input_ids = torch.cat([block_ids, query_ids], dim=1)
+            # Block positions
+            block_position_ids = torch.arange(
+                block_start_position, 
+                block_start_position + block_len, 
+                device=block_ids.device
+            ).unsqueeze(0)
+            # Query positions continue after block
+            query_position_ids = torch.arange(
+                block_start_position + block_len,
+                block_start_position + block_len + query_ids.shape[1],
+                device=query_ids.device
+            ).unsqueeze(0)
+            position_ids = torch.cat([block_position_ids, query_position_ids], dim=1)
         
         total_len = input_ids.shape[1]
         query_len = query_ids.shape[1]
@@ -519,6 +550,7 @@ class SequentialTopKProcessor:
         # Forward pass with output_attentions to get attention weights
         outputs = self.model(
             input_ids=input_ids,
+            position_ids=position_ids,
             output_attentions=True,
             use_cache=False,
         )
@@ -527,6 +559,7 @@ class SequentialTopKProcessor:
         attentions = list(outputs.attentions)
         del outputs
         del input_ids
+        del position_ids
         
         # Accumulate attention scores from all layers
         num_layers = len(attentions)
@@ -683,6 +716,7 @@ class SequentialTopKProcessor:
         for i, block in enumerate(blocks):
             summary_ids, summary_pos = self._sample_topk_from_block_with_context(
                 prefix_summaries=summaries,
+                prefix_positions=summary_positions,
                 block_ids=block,
                 query_ids=query_ids,
                 block_start_position=block_start_position,

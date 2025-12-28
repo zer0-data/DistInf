@@ -4,7 +4,7 @@ import time
 from datasets import load_dataset
 
 # Import the custom model class from your modified model.py file
-from model import CustomAccuracyModel
+from old.model import CustomAccuracyModel
 
 def main(args):
     """

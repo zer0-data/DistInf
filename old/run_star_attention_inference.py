@@ -73,7 +73,7 @@ def load_model(
     stop_words=None,
 ):
     if attn_type == 'dense':
-        from model import DenseAttentionModel
+        from old.model import DenseAttentionModel
 
         model = DenseAttentionModel(
             path=model_path,
@@ -82,7 +82,7 @@ def load_model(
         )
 
     elif attn_type == 'star':
-        from model import StarAttentionModel
+        from old.model import StarAttentionModel
 
         model = StarAttentionModel(
             path=model_path,

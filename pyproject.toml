@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bmrt"
+version = "0.1.0"
+description = "Bounded-Memory Recursive Transformer with Hybrid Cache and LSH Sampling"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.2.0",
+    "transformers>=4.38.0",
+    "datasets>=2.18.0",
+    "numpy>=1.26.0",
+    "tqdm>=4.66.0",
+    "accelerate>=0.27.0",
+    "scikit-learn>=1.4.0",
+]
+
+[project.optional-dependencies]
+flash-attn = ["flash-attn>=2.5.0"]
+
+[tool.setuptools.packages.find]
+include = ["bmrt*"]

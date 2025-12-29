@@ -1,97 +1,125 @@
 import argparse
-import torch
+import os
 import time
+import torch
+import gc
 from datasets import load_dataset
 
-# Import the custom model class from your modified model.py file
-from model import CustomAccuracyModel
+from bmrt import RecursiveCompressionEngine
 
 def main(args):
-    """
-    Main function to test SqueezedAttention-style inference on a single sample.
-    """
-    print("--- 1. Loading Data ---")
-    
+    print("\n" + "="*60)
+    print("  Recursive BMRT Inference Multi-Sample Test (v2.0)")
+    print("="*60)
+    print(f"\nConfiguration:")
+    print(f"  - Model: {args.model_path}")
+    print(f"  - Method: {args.method} (Backend: {args.backend})")
+    if args.method == 'lsh':
+        print(f"  - LSH Mode: {args.lsh_mode}")
+    print(f"  - Budget: {args.budget}")
+    print(f"  - Protection Divisor: {args.protection_divisor}")
+    print(f"  - Block size: {args.block_size}")
+    print(f"  - Top-K: {args.top_k} (Legacy arg, now implicitly global budget)")
+    print(f"  - Max new tokens: {args.max_new_tokens}")
+    print("="*60)
+
+    # --- 1. Load Data ---
+    print("\n--- 1. Loading Data ---")
     dataset_name = "RMT-team/babilong-1k-samples"
-    
-    print(f"Loading dataset '{dataset_name}', config '{args.dataset_config}', split '{args.dataset_split}'...")
     try:
         ds = load_dataset(dataset_name, args.dataset_config, split=args.dataset_split)
     except Exception as e:
         print(f"Failed to load dataset: {e}")
         return
 
-    sample = ds[args.sample_index]
-    
-    context = sample['input']
-    query = sample['question']
-    target = sample['target']
+    # --- 2. Load Engine ---
+    print("\n--- 2. Loading RecursiveCompressionEngine ---")
+    try:
+        engine = RecursiveCompressionEngine(
+            model_path=args.model_path,
+            selector_type=args.method,
+            lsh_mode=args.lsh_mode,
+            compression_mode=args.compression_mode,
+            backend=args.backend,
+            budget=args.budget,
+            protection_divisor=args.protection_divisor,
+            block_size=args.block_size,
+            max_new_tokens=args.max_new_tokens,
+            stop_words=args.stop_words.split(',') if args.stop_words else None,
+            hybrid_primary=args.hybrid_primary,
+            hybrid_secondary=args.hybrid_secondary,
+            hybrid_ratio=args.hybrid_ratio,
+        )
+        print("Engine loaded successfully.")
+    except Exception as e:
+        print(f"Failed to load engine: {e}")
+        return
 
-    print("\n--- Sample Details ---")
-    print(f"Context length: {len(context)} characters")
-    print(f"Query: {query}")
-    print(f"Ground Truth: {target}")
-    print("-" * 40)
-
-    # 2. Load Model
-    print("\n--- 2. Loading Model ---")
-    model = CustomAccuracyModel(
-        path=args.model_path,
-        max_new_tokens=args.max_new_tokens,
-        block_size=args.block_size,
-        k_summary_size=args.k_summary_size,
-        summary_method=args.summary_method,
-        pruning_percent=args.pruning_percent,
-        use_cosine_similarity=args.use_cosine_similarity,
-        multi_layer_aggregation=args.multi_layer_aggregation,
-        num_layers_for_clustering=args.num_layers_for_clustering,
-    )
-
-    # 3. Run Inference
+    # --- 3. Run Inference ---
     print("\n--- 3. Running Inference ---")
-    start_time = time.time()
-    
-    result = model(prompt_context=context, prompt_query=query)
-    
-    end_time = time.time()
-    prediction = result['text'][0]
+    correct = 0
+    total = 0
+    end_idx = min(args.start_sample_index + args.num_samples, len(ds))
 
-    # 4. Display Results
-    print("\n" + "="*60)
-    print("RESULTS")
-    print("="*60)
-    print(f"Time: {end_time - start_time:.2f} seconds")
-    print(f"\nQuery: {query}")
-    print(f"\nGround Truth: {target}")
-    print(f"\nPrediction: {prediction}")
-    print("="*60)
+    for i in range(args.start_sample_index, end_idx):
+        total += 1
+        sample = ds[i]
+        context = sample['input']
+        query = sample['question']
+        target = sample['target']
 
+        print(f"\nProcessing Sample {i}: len(context)={len(context)}")
+        # print(f"Query: {query}")
+        
+        try:
+            start = time.time()
+            result = engine(prompt_context=context, prompt_query=query)
+            duration = time.time() - start
+            
+            prediction = result['text'][0]
+            print(f"Prediction: {prediction}")
+            
+            if target.lower() in prediction.lower() or prediction.lower() in target.lower():
+                correct += 1
+                print("Match: PASS")
+            else:
+                print("Match: FAIL")
+                
+        except Exception as e:
+            print(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    if total > 0:
+        print(f"\nAccuracy: {correct/total*100:.2f}% ({correct}/{total})")
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Test SqueezedAttention-style inference")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model_path', required=True)
+    parser.add_argument('--method', default='exact', choices=['exact', 'lsh', 'hybrid'])
+    parser.add_argument('--lsh_mode', default='frequency_rank', choices=['frequency_rank', 'magicpig_baseline'])
+    parser.add_argument('--compression_mode', default='accumulate', choices=['accumulate', 'recursive'])
+    parser.add_argument('--backend', default='eager', choices=['eager', 'flash'])
+    parser.add_argument('--budget', type=int, default=4096)
+    parser.add_argument('--protection_divisor', type=int, default=4)
+    parser.add_argument('--block_size', type=int, default=4096)
+    parser.add_argument('--max_new_tokens', type=int, default=50)
+    parser.add_argument('--stop_words', default='')
     
-    parser.add_argument('--model_path', required=True, help='Model path')
-    parser.add_argument('--block_size', type=int, default=4096, help='Block size')
-    parser.add_argument('--k_summary_size', type=int, default=128, help='Summary size (for top_k method)')
-    parser.add_argument('--max_new_tokens', type=int, default=100, help='Max tokens to generate')
+    # Hybrid args
+    parser.add_argument('--hybrid_primary', default='exact')
+    parser.add_argument('--hybrid_secondary', default='lsh')
+    parser.add_argument('--hybrid_ratio', type=float, default=0.5)
     
-    # Summary method
-    parser.add_argument('--summary_method', type=str, default='kmeans', choices=['top_k', 'kmeans'])
-    parser.add_argument('--pruning_percent', type=float, default=90.0, 
-                        help='Percent of tokens to prune (0-100). E.g., 90 = keep 10%%')
-    
-    # K-means parameters
-    parser.add_argument('--use_cosine_similarity', action='store_true', default=True)
-    parser.add_argument('--no_cosine_similarity', action='store_false', dest='use_cosine_similarity')
-    parser.add_argument('--multi_layer_aggregation', action='store_true', default=True)
-    parser.add_argument('--no_multi_layer', action='store_false', dest='multi_layer_aggregation')
-    parser.add_argument('--num_layers_for_clustering', type=int, default=4, 
-                        help='Number of layers to aggregate for clustering')
-    
-    # Dataset
-    parser.add_argument('--dataset_config', type=str, default='16k')
-    parser.add_argument('--dataset_split', type=str, default='qa1')
-    parser.add_argument('--sample_index', type=int, default=0)
+    # Dataset args
+    parser.add_argument('--dataset_config', default='16k')
+    parser.add_argument('--dataset_split', default='qa1')
+    parser.add_argument('--start_sample_index', type=int, default=0)
+    parser.add_argument('--num_samples', type=int, default=1)
+    parser.add_argument('--top_k', type=int, default=0, help="Unused but kept for compatibility")
     
     args = parser.parse_args()
     main(args)

@@ -7,7 +7,7 @@ name = "bmrt"
 version = "0.1.0"
 description = "Bounded-Memory Recursive Transformer with Hybrid Cache and LSH Sampling"
 readme = "README.md"
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 dependencies = [
     "torch>=2.2.0",
     "transformers>=4.38.0",
@@ -16,10 +16,8 @@ dependencies = [
     "tqdm>=4.66.0",
     "accelerate>=0.27.0",
     "scikit-learn>=1.4.0",
+    "flash-attn @ https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.0/flash_attn-2.7.4+cu128torch2.9-cp311-cp311-linux_x86_64.whl",
 ]
-
-[project.optional-dependencies]
-flash-attn = ["flash-attn>=2.5.0"]
 
 [tool.setuptools.packages.find]
 include = ["bmrt*"]

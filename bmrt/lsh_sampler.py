@@ -42,7 +42,7 @@ class LSHSampler:
             bits: [N, L, K] (0/1 tensor)
         """
         # 1. Project: [N, D] @ [D, L*K] -> [N, L*K]
-        projections = torch.matmul(vectors, self.projection_matrix)
+        projections = torch.matmul(vectors, self.projection_matrix.to(dtype=vectors.dtype))
         
         # 2. Binarize: [N, L*K] -> 0/1
         bits = (projections > 0).long()

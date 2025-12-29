@@ -46,8 +46,8 @@ pip install -e .
 The default "Gold Standard" method. Uses exact attention scores to pick the most relevant global tokens.
 
 ```bash
-python run_topk_single_sample.py \
-    --model_path meta-llama/Llama-2-7b-hf \
+python run_single_sample.py \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
     --method exact \
     --backend eager \
     --budget 4096 \
@@ -58,8 +58,8 @@ python run_topk_single_sample.py \
 Optimized for speed. Uses Hash Collision frequency to approximate relevance.
 
 ```bash
-python run_topk_single_sample.py \
-    --model_path meta-llama/Llama-2-7b-hf \
+python run_single_sample.py \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
     --method lsh \
     --lsh_mode frequency_rank \
     --backend flash \
@@ -71,8 +71,8 @@ python run_topk_single_sample.py \
 Uses standard probabilistic sampling from LSH buckets.
 
 ```bash
-python run_topk_single_sample.py \
-    --model_path meta-llama/Llama-2-7b-hf \
+python run_single_sample.py \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
     --method lsh \
     --lsh_mode magicpig_baseline \
     --backend eager \
@@ -84,7 +84,7 @@ Combines Exact attention (for quality) with LSH (for diversity) using a configur
 
 ```bash
 python run_single_sample.py \
-    --model_path meta-llama/Llama-2-7b-hf \
+    --model_path meta-llama/Llama-3.1-8B-Instruct \
     --method hybrid \
     --hybrid_primary exact \
     --hybrid_secondary lsh \
@@ -111,7 +111,7 @@ To exhaustively test effectiveness, we recommend the following ablation grid (~1
 from bmrt import RecursiveCompressionEngine
 
 engine = RecursiveCompressionEngine(
-    model_path="meta-llama/Llama-2-7b-hf",
+    model_path="meta-llama/Llama-3.1-8B-Instruct",
     selector_type='exact',   # or 'lsh'
     backend='eager',         # or 'flash'
     budget=4096,             # Total tokens to keep

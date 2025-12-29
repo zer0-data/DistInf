@@ -207,19 +207,14 @@ class RecursiveCompressionEngine:
                 score_history=score_history
             )
 
-
-        # Fix for Flash Attention with gap in position_ids:
-        # We must provide an explicit attention values to prevent transformers 
-        # from incorrectly inferring sequence lengths from position_ids.
-        attention_mask = torch.ones_like(input_ids)
-
-        outputs = self.model(
-            input_ids=input_ids,
-            position_ids=position_ids,
-            attention_mask=attention_mask,
-            past_key_values=past_key_values,
-            use_cache=True,
-        )
+        from .patch_fa import ApplyFlashAttentionPatch
+        with ApplyFlashAttentionPatch():
+             outputs = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
         
         new_kv_cache = outputs.past_key_values
         if hasattr(new_kv_cache, 'to_legacy_cache'):

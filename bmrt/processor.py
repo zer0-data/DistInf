@@ -14,7 +14,7 @@ class RecursiveCompressionEngine:
     Manages the recursive compression loop:
     State_N = Compress(State_N-1 + Chunk_N)
     
-    Implements GEMINI v2.0 specs:
+    Implemented specs:
     - Dynamic Budgeting via protection_divisor
     - Hardware agnostic selection loop
     """
@@ -376,7 +376,10 @@ class RecursiveCompressionEngine:
                 block_start_position=block_start_position,
                 total_context_length=total_context_length
             )
-            accumulated_kv_cache = merge_kv_caches(accumulated_kv_cache, block_kv)
+            if self.compression_mode == 'recursive':
+                accumulated_kv_cache = block_kv
+            else:
+                accumulated_kv_cache = merge_kv_caches(accumulated_kv_cache, block_kv)
             block_start_position += block.shape[1]
             print(f"  Block {i+1} processed. Cache size: {accumulated_kv_cache[0][0].shape[2]}")
             

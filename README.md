@@ -100,7 +100,7 @@ To exhaustively test effectiveness, we recommend the following ablation grid (~1
 | :--- | :--- | :--- | :--- | :--- |
 | **Baseline** | Exact (Accumulate) | Eager | 1 | "Gold Standard" |
 | **Recursive** | Exact (Recursive) | Eager | 1 | Full history scoring |
-| **LSH** | Freq / MagicPIG | Flash | 4 | 2 Modes*2 Compre. Modes |
+| **LSH** | Freq / MagicPIG | Flash | 4 | 2 Modes x 2 Compre. Modes |
 | **Hybrid** | Exact + LSH | Eager | 12 | 2 Ratios (0.5, 0.75) x 3 Combinations x 2 Compr. Modes |
 
 *Note: Flash backend is recommended for LSH speed, but Eager is required if mixing with Exact (Hybrid).*

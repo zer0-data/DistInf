@@ -3,6 +3,7 @@ import os
 import time
 import torch
 import gc
+import datetime
 from datasets import load_dataset
 
 from bmrt import RecursiveCompressionEngine
@@ -25,7 +26,7 @@ def main(args):
 
     # --- 1. Load Data ---
     print("\n--- 1. Loading Data ---")
-    dataset_name = "RMT-team/babilong-1k-samples"
+    dataset_name = "RMT-team/babilong"
     try:
         ds = load_dataset(dataset_name, args.dataset_config, split=args.dataset_split)
     except Exception as e:
@@ -94,7 +95,26 @@ def main(args):
         torch.cuda.empty_cache()
 
     if total > 0:
-        print(f"\nAccuracy: {correct/total*100:.2f}% ({correct}/{total})")
+        accuracy = correct/total*100
+        print(f"\nAccuracy: {accuracy:.2f}% ({correct}/{total})")
+
+        # Append a results line to the results file (if provided)
+        results_line = (
+            f"{datetime.datetime.utcnow().isoformat()} | model={args.model_path} | "
+            f"dataset={args.dataset_config}/{args.dataset_split} | method={args.method} | "
+            f"lsh_mode={args.lsh_mode} | hybrid={args.hybrid_primary}+{args.hybrid_secondary}:{args.hybrid_ratio} | "
+            f"backend={args.backend} | compression_mode={args.compression_mode} | "
+            f"sampling_config=budget:{args.budget},block_size:{args.block_size},top_k:{args.top_k} | "
+            f"protection_divisor={args.protection_divisor} | "
+            f"samples=start:{args.start_sample_index},n:{args.num_samples} | "
+            f"correct={correct}/{total} | accuracy={accuracy:.2f}%\n"
+        )
+
+        try:
+            with open(args.results_file, 'a', encoding='utf-8') as rf:
+                rf.write(results_line)
+        except Exception as e:
+            print(f"Failed to write results to {args.results_file}: {e}")
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -120,6 +140,7 @@ if __name__ == '__main__':
     parser.add_argument('--start_sample_index', type=int, default=0)
     parser.add_argument('--num_samples', type=int, default=1)
     parser.add_argument('--top_k', type=int, default=0, help="Unused but kept for compatibility")
+    parser.add_argument('--results_file', default='accuracies.txt', help='File to append accuracy results')
     
     args = parser.parse_args()
     main(args)

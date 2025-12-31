@@ -333,9 +333,10 @@ class RecursiveCompressionEngine:
                     if si >= cache_block_start:
                         curr_selected_abs.append(int(si))
 
-            # Current-block kept indices are fixed_indices U selected-from-current-block
+            # Current-block kept indices: ANCHORS (not local tail) U selected-from-current-block
             curr_selected_relative = [i - cache_block_start for i in curr_selected_abs]
-            all_selected_relative = sorted(list(set(fixed_indices) | set(curr_selected_relative)))
+            anchor_relative = anchor_indices
+            all_selected_relative = sorted(list(set(anchor_relative) | set(curr_selected_relative)))
             all_selected_relative = [idx for idx in all_selected_relative if 0 <= idx < block_len]
             summary_ids = block_ids.index_select(dim=1, index=torch.tensor(all_selected_relative, device=self.device))
 

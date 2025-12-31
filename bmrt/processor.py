@@ -64,6 +64,10 @@ class RecursiveCompressionEngine:
             )
         
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Bookkeeping for the previous block's local tail (not persisted into accumulated cache
+        # except the final tail which will be merged after processing all blocks)
+        self.prev_local_tail_kv: Optional[Tuple] = None
+        self.prev_local_tail_len: int = 0
         
         print(f"\n[RecursiveCompressionEngine] Initializing...")
         print(f"  Model: {model_path}")
@@ -192,8 +196,19 @@ class RecursiveCompressionEngine:
         past_key_values = None
         prefix_cache_len = 0
         if prefix_kv_cache is not None:
-            past_key_values = DynamicCache.from_legacy_cache(prefix_kv_cache)
             prefix_cache_len = prefix_kv_cache[0][0].shape[2]
+
+        # If we have a previous local tail (accumulate mode), temporarily
+        # merge it into the prefix cache for scoring/selection only. We do
+        # NOT persist this merge into the running `accumulated_kv_cache`.
+        temp_prefix_kv = prefix_kv_cache
+        temp_prefix_cache_len = prefix_cache_len
+        if self.compression_mode == 'accumulate' and self.prev_local_tail_kv is not None and self.prev_local_tail_len > 0:
+            temp_prefix_kv = merge_kv_caches(prefix_kv_cache, self.prev_local_tail_kv)
+            temp_prefix_cache_len = prefix_cache_len + self.prev_local_tail_len
+
+        if temp_prefix_kv is not None:
+            past_key_values = DynamicCache.from_legacy_cache(temp_prefix_kv)
         
         # Prepare Selector (for eager exact accumulator)
         score_history = (self.compression_mode == 'recursive')
@@ -203,7 +218,7 @@ class RecursiveCompressionEngine:
                 prefix_len=0,
                 block_len=block_len,
                 query_len=query_len,
-                prefix_in_kv=prefix_cache_len,
+                prefix_in_kv=temp_prefix_cache_len,
                 score_history=score_history
             )
 
@@ -224,53 +239,51 @@ class RecursiveCompressionEngine:
         # Selection Phase
         candidate_indices_set = set(range(block_len)) - set(fixed_indices)
         candidate_indices = sorted(list(candidate_indices_set))
-        
-        # In Recursive Mode, we also consider history candidates!
-        if self.compression_mode == 'recursive' and self.global_budget > 0:
-             # Transform current block candidates to absolute
-             current_block_candidates = [prefix_cache_len + idx for idx in candidate_indices]
-             
-             # History Range: [0, prefix_cache_len)
-             history_candidates = []
-             if prefix_cache_len > 0:
-                 start_cand = min(self.anchor_size, prefix_cache_len)
-                 history_candidates = list(range(start_cand, prefix_cache_len))
 
-             pool_candidates_absolute = history_candidates + current_block_candidates
-             candidate_indices = sorted(pool_candidates_absolute)
-        
         selected_indices_only = []
         if candidate_indices and self.global_budget > 0:
             # Prepare data for selection
-            last_layer_key = new_kv_cache[-1][0] 
-            
-            cache_block_start = prefix_cache_len
-            cache_query_start = prefix_cache_len + block_len
-            
-            # Candidate vectors (Mean over heads)
+            last_layer_key = new_kv_cache[-1][0]
+
+            # Using temp_prefix_cache_len because temp_prefix_kv may include prev tail
+            cache_block_start = temp_prefix_cache_len
+            cache_query_start = temp_prefix_cache_len + block_len
+
+            # Build absolute candidate indices list
             if self.compression_mode == 'recursive':
-                 cand_tensor_indices = torch.tensor(candidate_indices, device=self.device, dtype=torch.long)
+                # For recursive, use history logic (absolute indices)
+                cand_abs_indices = [prefix_cache_len + idx for idx in candidate_indices]
             else:
-                 cand_abs_indices = [cache_block_start + idx for idx in candidate_indices]
-                 cand_tensor_indices = torch.tensor(cand_abs_indices, device=self.device, dtype=torch.long)
-            
+                cand_abs_indices = []
+                # Include previous local tail absolute indices if present
+                if self.compression_mode == 'accumulate' and self.prev_local_tail_kv is not None and self.prev_local_tail_len > 0:
+                    cand_abs_indices.extend(list(range(prefix_cache_len, prefix_cache_len + self.prev_local_tail_len)))
+                # Current-block candidate absolutes (block comes after temp prefix)
+                cand_abs_indices.extend([cache_block_start + idx for idx in candidate_indices])
+
+            cand_tensor_indices = torch.tensor(cand_abs_indices, device=self.device, dtype=torch.long)
+
+            # Candidate vectors (Mean over heads)
             candidate_vectors = last_layer_key.index_select(dim=2, index=cand_tensor_indices)[0].mean(dim=0)
-            
+
             # Query vectors
             query_vectors = last_layer_key[:, :, cache_query_start:, :][0].mean(dim=0)
-            
+
             selected_indices_only = self.selector.select(
                 query_ids=query_ids,
                 query_vectors=query_vectors,
                 candidate_vectors=candidate_vectors,
-                candidate_indices=candidate_indices,
+                candidate_indices=cand_abs_indices,
                 budget=self.global_budget
             )
 
         if hasattr(self.selector, 'finish_block'):
             self.selector.finish_block()
-        
+
         # 8. Update Phase
+        # After selection, we need to handle mapping selected indices back to
+        # either previous-tail entries or current-block entries. For accumulate
+        # mode we may have prev-selected items stored separately.
         if self.compression_mode == 'recursive':
              # Reconstruct absolute indices to keep:
              # 1. Global Anchor
@@ -290,7 +303,7 @@ class RecursiveCompressionEngine:
              # Merge and Sort
              final_indices_set = set(global_anchor_indices) | set(current_block_fixed_absolute) | set(selected_indices_only)
              all_selected_indices_absolute = sorted(list(final_indices_set))
-             
+            
              extraction_indices = all_selected_indices_absolute
              extraction_offset = 0 # Offset 0 because indices are absolute into the full cache
              
@@ -301,19 +314,63 @@ class RecursiveCompressionEngine:
              
         else:
             # Standard Accumulate behavior
-            all_selected_indices = sorted(list(set(fixed_indices) | set(selected_indices_only)))
-            all_selected_indices = [idx for idx in all_selected_indices if 0 <= idx < block_len] # Safety
-            summary_ids = block_ids.index_select(dim=1, index=torch.tensor(all_selected_indices, device=self.device))
-            
-            extraction_indices = all_selected_indices
-            extraction_offset = prefix_cache_len
+            # selected_indices_only contains absolute indices into new_kv_cache
+            cache_block_start = temp_prefix_cache_len
+
+            # Partition selected absolutes into prev-tail (from previous tail) and current-block selections
+            prev_selected_abs = []
+            curr_selected_abs = []
+            if self.compression_mode == 'accumulate' and self.prev_local_tail_kv is not None and self.prev_local_tail_len > 0:
+                prev_range_start = prefix_cache_len
+                prev_range_end = prefix_cache_len + self.prev_local_tail_len
+                for si in selected_indices_only:
+                    if prev_range_start <= si < prev_range_end:
+                        prev_selected_abs.append(int(si))
+                    elif si >= cache_block_start:
+                        curr_selected_abs.append(int(si))
+            else:
+                for si in selected_indices_only:
+                    if si >= cache_block_start:
+                        curr_selected_abs.append(int(si))
+
+            # Current-block kept indices are fixed_indices U selected-from-current-block
+            curr_selected_relative = [i - cache_block_start for i in curr_selected_abs]
+            all_selected_relative = sorted(list(set(fixed_indices) | set(curr_selected_relative)))
+            all_selected_relative = [idx for idx in all_selected_relative if 0 <= idx < block_len]
+            summary_ids = block_ids.index_select(dim=1, index=torch.tensor(all_selected_relative, device=self.device))
+
+            # Extract KV for both prev-selected absolutes and current-block kept absolutes
+            extraction_abs_current = [cache_block_start + idx for idx in all_selected_relative]
+            extraction_indices = []
+            extraction_indices.extend(prev_selected_abs)
+            extraction_indices.extend(extraction_abs_current)
+            extraction_offset = 0
         
+        # Extract KV for the selected absolute indices from new_kv_cache
         extracted_kv = extract_kv_for_indices(
             new_kv_cache,
             extraction_indices,
             offset=extraction_offset,
             device=self.device
         )
+
+        # Store current block's local tail KV for use by the next block's selection.
+        # We do NOT merge this tail into the accumulated cache now; it will only be
+        # merged after processing the final block.
+        if len(local_indices) > 0:
+            # local_indices are relative to the block; convert to absolute positions
+            cache_block_start = temp_prefix_cache_len
+            local_abs_indices = [cache_block_start + idx for idx in local_indices]
+            self.prev_local_tail_kv = extract_kv_for_indices(
+                new_kv_cache,
+                local_abs_indices,
+                offset=0,
+                device=self.device
+            )
+            self.prev_local_tail_len = len(local_indices)
+        else:
+            self.prev_local_tail_kv = None
+            self.prev_local_tail_len = 0
         
         # Return something meaningful for `selected_indices`?
         # The return value `all_selected_indices` in signature is usually used for debugging.
@@ -382,6 +439,10 @@ class RecursiveCompressionEngine:
                 accumulated_kv_cache = merge_kv_caches(accumulated_kv_cache, block_kv)
             block_start_position += block.shape[1]
             print(f"  Block {i+1} processed. Cache size: {accumulated_kv_cache[0][0].shape[2]}")
-            
+        # After processing all blocks, merge the final local tail (if any) into the
+        # accumulated cache so the final window is preserved for generation.
+        if self.compression_mode == 'accumulate' and self.prev_local_tail_kv is not None:
+            accumulated_kv_cache = merge_kv_caches(accumulated_kv_cache, self.prev_local_tail_kv)
+
         generated_ids = self._generate(query_ids, accumulated_kv_cache, total_context_length)
         return {'text': [self._get_output_text(generated_ids)]}

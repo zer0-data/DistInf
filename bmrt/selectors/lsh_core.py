@@ -11,7 +11,7 @@ class LSHSelector(BaseSelector):
     2. 'magicpig_baseline': Probabilistic sampling from matching buckets.
     """
     
-    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 4, num_tables: int = 4, device: str = 'cuda'):
+    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 14, num_tables: int = 20, device: str = 'cuda'):
         self.lsh_sampler = LSHSampler(head_dim=head_dim, num_bits=num_bits, num_tables=num_tables, device=device)
         self.device = device
         self.lsh_mode = lsh_mode
@@ -39,33 +39,25 @@ class LSHSelector(BaseSelector):
         if budget <= 0:
             return []
 
-        # 1. Centering & Hashing
-        c_mean = candidate_vectors.mean(dim=0, keepdim=True)
-        centered_query = query_vectors - c_mean
-        centered_candidates = candidate_vectors - c_mean
-        
-        q_hashes = self.lsh_sampler._compute_hashes(centered_query)
-        c_hashes = self.lsh_sampler._compute_hashes(centered_candidates)
-        
-        num_buckets = 2 ** self.lsh_sampler.num_bits
-        
-        # 2. Selection Logic
+        # Delegate the frequency-rank path to the sampler to avoid
+        # duplicating centering, hashing, collision counting and sorting.
         if self.lsh_mode == 'frequency_rank':
-            # Our Method: Collision Counting
-            collision_counts = torch.zeros(len(candidate_indices), device=self.device, dtype=torch.int32)
-            
-            for l in range(self.lsh_sampler.num_tables):
-                q_h = q_hashes[:, l]
-                c_h = c_hashes[:, l]
-                
-                bucket_mask = torch.zeros(num_buckets, device=self.device, dtype=torch.bool)
-                bucket_mask.index_fill_(0, q_h.long(), True)
-                
-                hits = bucket_mask[c_h.long()]
-                collision_counts += hits.int()
-                
-            sorted_indices = torch.argsort(collision_counts, descending=True, stable=True)
-            top_k_indices = sorted_indices[:budget]
+            # Try to obtain candidate attention scores if provided by caller
+            candidate_scores = kwargs.get('candidate_scores', None)
+            if candidate_scores is None:
+                # Fall back to zeros (preserves existing behavior when scores
+                # are not available in the pipeline).
+                candidate_scores = torch.zeros(len(candidate_indices), device=self.device, dtype=candidate_vectors.dtype)
+
+            # sampler.select_global_tokens expects: query_vectors, candidate_vectors,
+            # candidate_indices, candidate_scores, budget -> returns sorted list
+            return self.lsh_sampler.select_global_tokens(
+                query_vectors=query_vectors,
+                candidate_vectors=candidate_vectors,
+                candidate_indices=candidate_indices,
+                candidate_scores=candidate_scores,
+                budget=budget,
+            )
             
         # elif self.lsh_mode == 'magicpig_baseline':
         #     # MagicPIG: Deterministic Probability-Based Selection
@@ -126,9 +118,14 @@ class LSHSelector(BaseSelector):
         #          top_k_indices = torch.cat([valid_indices_local, torch.tensor(fallback_local, device=self.device)])
         
         elif self.lsh_mode == 'magicpig_baseline':
-            # 1. Compute Hash Bits (Integer form)
-            q_buckets = self.lsh_sampler._compute_hashes(centered_query) 
-            c_buckets = self.lsh_sampler._compute_hashes(centered_candidates)
+            # 1. Center and compute hashes/bits for MagicPIG baseline
+            c_mean = candidate_vectors.mean(dim=0, keepdim=True)
+            centered_query = query_vectors - c_mean
+            centered_candidates = candidate_vectors - c_mean
+
+            # Use public API to compute hashes
+            q_buckets = self.lsh_sampler.compute_hashes(centered_query)
+            c_buckets = self.lsh_sampler.compute_hashes(centered_candidates)
             
             num_tables = self.lsh_sampler.num_tables
             num_bits = self.lsh_sampler.num_bits
@@ -160,8 +157,8 @@ class LSHSelector(BaseSelector):
 
             # 4. Probability Scoring (on survivors only)
             c_subset_vecs = centered_candidates[candidate_indices_local]
-            c_bits_subset = self.lsh_sampler.compute_bits(c_subset_vecs) 
-            q_bits = self.lsh_sampler.compute_bits(centered_query)       
+            c_bits_subset = self.lsh_sampler.compute_bits(c_subset_vecs)
+            q_bits = self.lsh_sampler.compute_bits(centered_query)
             
             # Calculate Hamming Similarity (p)
             matches = (q_bits.unsqueeze(1) == c_bits_subset.unsqueeze(0)) 

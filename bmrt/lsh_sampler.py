@@ -68,6 +68,13 @@ class LSHSampler:
         
         return hashes.int()
 
+    def compute_hashes(self, vectors: torch.Tensor) -> torch.Tensor:
+        """
+        Public wrapper for computing hash codes. Preserves the original protected
+        implementation while exposing a stable API for external callers.
+        """
+        return self._compute_hashes(vectors)
+
 
     def select_global_tokens(
         self,

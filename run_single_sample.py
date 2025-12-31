@@ -15,8 +15,9 @@ def main(args):
     print(f"\nConfiguration:")
     print(f"  - Model: {args.model_path}")
     print(f"  - Method: {args.method} (Backend: {args.backend})")
-    if args.method == 'lsh':
+    if args.method == 'lsh' or args.method == 'hybrid':
         print(f"  - LSH Mode: {args.lsh_mode}")
+        print(f"  - LSH Config: num_bits={args.num_bits}, num_tables={args.num_tables}")
     print(f"  - Budget: {args.budget}")
     print(f"  - Protection Divisor: {args.protection_divisor}")
     print(f"  - Block size: {args.block_size}")
@@ -47,6 +48,8 @@ def main(args):
             block_size=args.block_size,
             max_new_tokens=args.max_new_tokens,
             stop_words=args.stop_words.split(',') if args.stop_words else None,
+            num_bits=args.num_bits,
+            num_tables=args.num_tables,
             hybrid_primary=args.hybrid_primary,
             hybrid_secondary=args.hybrid_secondary,
             hybrid_ratio=args.hybrid_ratio,
@@ -128,6 +131,10 @@ if __name__ == '__main__':
     parser.add_argument('--block_size', type=int, default=4096)
     parser.add_argument('--max_new_tokens', type=int, default=50)
     parser.add_argument('--stop_words', default='')
+    
+    # LSH args
+    parser.add_argument('--num_bits', type=int, default=12, help='Number of bits per LSH hash')
+    parser.add_argument('--num_tables', type=int, default=20, help='Number of LSH hash tables')
     
     # Hybrid args
     parser.add_argument('--hybrid_primary', default='exact')

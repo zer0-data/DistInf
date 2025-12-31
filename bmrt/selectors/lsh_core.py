@@ -1,7 +1,6 @@
 import torch
 from typing import List, Optional
 from .base import BaseSelector
-from ..lsh_sampler import LSHSampler 
 
 class LSHSelector(BaseSelector):
     """
@@ -11,8 +10,10 @@ class LSHSelector(BaseSelector):
     2. 'magicpig_baseline': Probabilistic sampling from matching buckets.
     """
     
-    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 4, num_tables: int = 4, device: str = 'cuda'):
-        self.lsh_sampler = LSHSampler(head_dim=head_dim, num_bits=num_bits, num_tables=num_tables, device=device)
+    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda'):
+        self.head_dim = head_dim
+        self.num_bits = num_bits
+        self.num_tables = num_tables
         self.device = device
         self.lsh_mode = lsh_mode
         if lsh_mode not in ['frequency_rank', 'magicpig_baseline']:
@@ -23,6 +24,50 @@ class LSHSelector(BaseSelector):
         
     def cleanup(self):
         pass
+
+    def compute_bits(self, vectors: torch.Tensor) -> torch.Tensor:
+        """
+        Compute raw hash bits for multiple tables.
+        
+        Args:
+            vectors: [N, D]
+            
+        Returns:
+            bits: [N, L, K] (0/1 tensor)
+        """
+        # 1. Project: [N, D] @ [D, L*K] -> [N, L*K]
+        projections = torch.matmul(vectors, self.projection_matrix.to(dtype=vectors.dtype))
+        
+        # 2. Binarize: [N, L*K] -> 0/1
+        bits = (projections > 0).long()
+        
+        # 3. Reshape separate tables: [N, L, K]
+        return bits.view(-1, self.num_tables, self.num_bits)
+
+    def _compute_hashes(self, vectors: torch.Tensor) -> torch.Tensor:
+        """
+        Compute hash codes for multiple tables.
+        
+        Args:
+            vectors: [N, D]
+            
+        Returns:
+            hashes: [N, Tables] (Int32 hash codes)
+        """
+        # Reuse compute_bits
+        bits = self.compute_bits(vectors) # [N, L, K]
+        
+        # 4. Pack bits into integer hashes: [N, L, K] * [1, 1, K] -> Sum -> [N, L]
+        hashes = (bits * self.powers_of_two).sum(dim=-1)
+        
+        return hashes.int()
+
+    def compute_hashes(self, vectors: torch.Tensor) -> torch.Tensor:
+        """
+        Public wrapper for computing hash codes. Preserves the original protected
+        implementation while exposing a stable API for external callers.
+        """
+        return self._compute_hashes(vectors)
 
     def select(
         self,
@@ -44,17 +89,17 @@ class LSHSelector(BaseSelector):
         centered_query = query_vectors - c_mean
         centered_candidates = candidate_vectors - c_mean
         
-        q_hashes = self.lsh_sampler._compute_hashes(centered_query)
-        c_hashes = self.lsh_sampler._compute_hashes(centered_candidates)
+        q_hashes = self.compute_hashes(centered_query)
+        c_hashes = self.compute_hashes(centered_candidates)
         
-        num_buckets = 2 ** self.lsh_sampler.num_bits
+        num_buckets = 2 ** self.num_bits
         
         # 2. Selection Logic
         if self.lsh_mode == 'frequency_rank':
             # Our Method: Collision Counting
             collision_counts = torch.zeros(len(candidate_indices), device=self.device, dtype=torch.int32)
             
-            for l in range(self.lsh_sampler.num_tables):
+            for l in range(self.num_tables):
                 q_h = q_hashes[:, l]
                 c_h = c_hashes[:, l]
                 
@@ -72,10 +117,10 @@ class LSHSelector(BaseSelector):
         #     # Reference: "MagicPIG: LSH Sampling for Efficient LLM Context Compression"
             
         #     # 1. Compute Raw Bits
-        #     q_bits = self.lsh_sampler.compute_bits(centered_query) # [Q, L, K]
-        #     c_bits = self.lsh_sampler.compute_bits(centered_candidates) # [C, L, K]
+        #     q_bits = self.compute_bits(centered_query) # [Q, L, K]
+        #     c_bits = self.compute_bits(centered_candidates) # [C, L, K]
             
-        #     L, K = self.lsh_sampler.num_tables, self.lsh_sampler.num_bits
+        #     L, K = self.num_tables, self.num_bits
             
         #     # 2. Collision Filtering (Matches >= 2 Tables)
         #     # Expand dimensions for broadcast: [Q, 1, L, K] == [1, C, L, K]
@@ -127,11 +172,11 @@ class LSHSelector(BaseSelector):
         
         elif self.lsh_mode == 'magicpig_baseline':
             # 1. Compute Hash Bits (Integer form)
-            q_buckets = self.lsh_sampler._compute_hashes(centered_query) 
-            c_buckets = self.lsh_sampler._compute_hashes(centered_candidates)
+            q_buckets = self.compute_hashes(centered_query) 
+            c_buckets = self.compute_hashes(centered_candidates)
             
-            num_tables = self.lsh_sampler.num_tables
-            num_bits = self.lsh_sampler.num_bits
+            num_tables = self.num_tables
+            num_bits = self.num_bits
             
             # 2. Efficient Bucket Retrieval
             # Offset buckets to make them unique across tables
@@ -160,8 +205,8 @@ class LSHSelector(BaseSelector):
 
             # 4. Probability Scoring (on survivors only)
             c_subset_vecs = centered_candidates[candidate_indices_local]
-            c_bits_subset = self.lsh_sampler.compute_bits(c_subset_vecs) 
-            q_bits = self.lsh_sampler.compute_bits(centered_query)       
+            c_bits_subset = self.compute_bits(c_subset_vecs) 
+            q_bits = self.compute_bits(centered_query)       
             
             # Calculate Hamming Similarity (p)
             matches = (q_bits.unsqueeze(1) == c_bits_subset.unsqueeze(0)) 

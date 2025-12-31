@@ -31,6 +31,9 @@ class RecursiveCompressionEngine:
         block_size: int = 4096,
         max_new_tokens: int = 100,
         stop_words: Optional[List[str]] = None,
+        # LSH Config
+        num_bits: int = 12,
+        num_tables: int = 20,
         # Hybrid Config
         hybrid_primary: str = 'exact',
         hybrid_secondary: str = 'lsh',
@@ -47,6 +50,8 @@ class RecursiveCompressionEngine:
         self.block_size = block_size
         self.max_new_tokens = max_new_tokens
         self.stop_words = stop_words or []
+        self.num_bits = num_bits
+        self.num_tables = num_tables
         
         # Valid modes
         if compression_mode not in ['accumulate', 'recursive']:
@@ -118,6 +123,8 @@ class RecursiveCompressionEngine:
             return LSHSelector(
                 head_dim=head_dim, 
                 lsh_mode=self.lsh_mode, 
+                num_bits=self.num_bits,
+                num_tables=self.num_tables,
                 device=self.device
             )
         else:

@@ -8,6 +8,8 @@ from datasets import load_dataset
 
 from bmrt import RecursiveCompressionEngine
 
+import sys
+
 def main(args):
     print("\n" + "="*60)
     print("  Recursive BMRT Inference Multi-Sample Test (v2.0)")
@@ -36,7 +38,7 @@ def main(args):
 
     # Helper to build engine per-sample (so we can fully release memory afterwards)
     def build_engine():
-        print("\n--- Loading RecursiveCompressionEngine ---")
+        # print("\n--- Loading RecursiveCompressionEngine ---")
         try:
             eng = RecursiveCompressionEngine(
                 model_path=args.model_path,
@@ -55,7 +57,7 @@ def main(args):
                 hybrid_secondary=args.hybrid_secondary,
                 hybrid_ratio=args.hybrid_ratio,
             )
-            print("Engine loaded successfully.")
+            # print("Engine loaded successfully.")
             return eng
         except Exception as e:
             print(f"Failed to load engine: {e}")
@@ -66,19 +68,26 @@ def main(args):
     correct = 0
     total = 0
     end_idx = min(args.start_sample_index + args.num_samples, len(ds))
+    
+    total_samples = end_idx - args.start_sample_index
+    print(f"Processing {total_samples} samples...")
 
-    for i in range(args.start_sample_index, end_idx):
+    for idx, i in enumerate(range(args.start_sample_index, end_idx)):
+        # Manual Progress Bar
+        sys.stdout.write(f"\rProgress: [{idx+1}/{total_samples}] ({(idx+1)/total_samples*100:.1f}%)")
+        sys.stdout.flush()
+        
         total += 1
         sample = ds[i]
         context = sample['input']
         query = sample['question']
         target = sample['target']
 
-        print(f"\nProcessing Sample {i}: len(context)={len(context)}")
+        # print(f"\nProcessing Sample {i}: len(context)={len(context)}")
 
         engine = build_engine()
         if engine is None:
-            print("Skipping sample due to engine load failure.")
+            print("\nSkipping sample due to engine load failure.")
             continue
 
         try:
@@ -87,16 +96,16 @@ def main(args):
             duration = time.time() - start
 
             prediction = result['text'][0]
-            print(f"Prediction: {prediction}")
+            # print(f"Prediction: {prediction}")
 
             if target.lower() in prediction.lower() or prediction.lower() in target.lower():
                 correct += 1
-                print("Match: PASS")
+                # print("Match: PASS")
             else:
-                print("Match: FAIL")
+                pass # print("Match: FAIL")
 
         except Exception as e:
-            print(f"Error: {e}")
+            print(f"\nError processing sample {i}: {e}")
             import traceback
             traceback.print_exc()
 
@@ -111,7 +120,8 @@ def main(args):
             pass
         gc.collect()
         torch.cuda.empty_cache()
-
+    
+    print("") # Newline after progress bar
     if total > 0:
         accuracy = correct/total*100
         print(f"\nAccuracy: {accuracy:.2f}% ({correct}/{total})")

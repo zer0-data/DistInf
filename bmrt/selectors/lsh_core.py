@@ -19,6 +19,19 @@ class LSHSelector(BaseSelector):
         if lsh_mode not in ['frequency_rank', 'magicpig_baseline']:
             raise ValueError(f"Invalid lsh_mode: {lsh_mode}")
 
+        # Initialize LSH Projections
+        # Matrix: [D, num_tables * num_bits]
+        self.projection_matrix = torch.randn(
+            head_dim, 
+            num_tables * num_bits, 
+            device=device, 
+            dtype=torch.float32  # Will cast during matmul if needed
+        )
+        
+        # Pre-compute powers of two for hashing
+        # [1, 1, num_bits]
+        self.powers_of_two = (2 ** torch.arange(num_bits, device=device)).view(1, 1, -1)
+
     def setup(self, model):
         pass
         

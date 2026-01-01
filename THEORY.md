@@ -71,7 +71,6 @@ To avoid $O(N^2)$ compute, we use **Locality Sensitive Hashing (LSH)**.
 *   We use multiple hash tables (SimHash).
 *   We count exactly how many times a candidate collides with *any* query token (Collision_Count).
 *   Selection sorts primarily by `Collision_Count`. A configurable tie-breaking hyperparameter `mode` controls secondary ordering:
-    - `attention_it`: (default) use attention scores as the secondary key (higher is better), preserving a stable attention-driven order.
     - `l2`: use the L2 (Euclidean) distance between the candidate vector and the (mean) query vector as the secondary key (lower is better).
     - `none`: no secondary key; pure collision-count ordering.
 *   Decoupling tie-breaking from the primary LSH ranking allows experimenting with alternative heuristics (e.g., distance-based) without changing the collision counting logic.

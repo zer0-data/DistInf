@@ -5,17 +5,25 @@ from .base import BaseSelector
 class LSHSelector(BaseSelector):
     """
     Selects tokens using LSH techniques.
-    Supports two modes:
+    Supports two LSH modes:
     1. 'frequency_rank' (Ours): Sort by collision count (Primary) + Attention Score (Secondary).
     2. 'magicpig_baseline': Probabilistic sampling from matching buckets.
+
+    Additionally, a tie-breaking `mode` hyperparameter controls how ties in
+    collision counts are resolved. The current implemented tie-breaker is
+    named 'attention_it' and uses attention scores as a secondary stable key.
     """
     
-    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda'):
+    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda', mode: str = 'attention_it'):
         self.head_dim = head_dim
         self.num_bits = num_bits
         self.num_tables = num_tables
         self.device = device
         self.lsh_mode = lsh_mode
+        # Tie-breaking mode (hyperparameter)
+        self.mode = mode
+        if mode not in ['attention_it', 'l2', 'none']:
+            raise ValueError(f"Invalid tie-breaking mode: {mode}")
         if lsh_mode not in ['frequency_rank', 'magicpig_baseline']:
             raise ValueError(f"Invalid lsh_mode: {lsh_mode}")
 
@@ -122,25 +130,50 @@ class LSHSelector(BaseSelector):
                 hits = bucket_mask[c_h.long()]
                 collision_counts += hits.int()
             
-            # --- TIE-BREAKING LOGIC RESTORED FROM LSH_SAMPLER ---
+            # --- TIE-BREAKING LOGIC (controlled via `self.mode`) ---
             candidate_scores = kwargs.get('candidate_scores')
 
-            if candidate_scores is not None:
+            # If mode is 'attention_it' and attention scores are provided,
+            # use attention as a stable secondary key (descending).
+            # If mode is 'l2', use L2 (Euclidean) distance to the query
+            # as a secondary key (ascending). Otherwise fall back to
+            # sorting by collision count only.
+            if self.mode == 'attention_it' and candidate_scores is not None:
                 # 1. Sort by secondary key (Attention Score) DESC
                 sorted_by_score_indices = torch.argsort(candidate_scores, descending=True)
-                
+
                 # 2. Re-order counts based on score sort
                 sorted_counts = collision_counts[sorted_by_score_indices]
-                
+
                 # 3. Sort by primary key (Collision Counts) DESC using stable sort
                 # This ensures that if counts are equal, the order from step 1 (scores) is preserved
                 sorted_by_count_indices = torch.argsort(sorted_counts, descending=True, stable=True)
-                
+
                 # 4. Combine to get final indices
                 final_prioritized_indices = sorted_by_score_indices[sorted_by_count_indices]
                 top_k_indices = final_prioritized_indices[:budget]
+            elif self.mode == 'l2':
+                # Compute L2 distances between the (mean) query vector and candidates.
+                # Use the mean of query_vectors if multiple query vectors are present.
+                # centered_query: [Q, D] -> take mean -> [D]
+                q_vec = centered_query.mean(dim=0, keepdim=True)
+                # centered_candidates: [C, D]
+                dists = torch.norm(centered_candidates - q_vec, dim=1)
+
+                # 1. Sort by secondary key (L2 distance) ASC
+                sorted_by_dist_indices = torch.argsort(dists, descending=False)
+
+                # 2. Re-order counts based on distance sort
+                sorted_counts = collision_counts[sorted_by_dist_indices]
+
+                # 3. Sort by primary key (Collision Counts) DESC using stable sort
+                sorted_by_count_indices = torch.argsort(sorted_counts, descending=True, stable=True)
+
+                # 4. Combine to get final indices
+                final_prioritized_indices = sorted_by_dist_indices[sorted_by_count_indices]
+                top_k_indices = final_prioritized_indices[:budget]
             else:
-                # Fallback: Sort purely by collision count if no scores provided
+                # Default/fallback: Sort purely by collision count (stable)
                 sorted_indices = torch.argsort(collision_counts, descending=True, stable=True)
                 top_k_indices = sorted_indices[:budget]
         

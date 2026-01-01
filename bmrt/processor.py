@@ -24,6 +24,7 @@ class RecursiveCompressionEngine:
         model_path: str,
         selector_type: str = 'exact', # 'exact', 'lsh', or 'hybrid'
         lsh_mode: str = 'frequency_rank', # 'frequency_rank' or 'magicpig_baseline'
+        selector_mode: str = 'attention_it', # tie-breaker: 'attention_it', 'l2', or 'none'
         compression_mode: str = 'accumulate', # 'accumulate' or 'recursive'
         backend: str = 'eager', # 'eager' or 'flash'
         budget: int = 4096, # Total budget
@@ -43,6 +44,7 @@ class RecursiveCompressionEngine:
         self.model_path = model_path
         self.selector_type = selector_type
         self.lsh_mode = lsh_mode
+        self.selector_mode = selector_mode
         self.compression_mode = compression_mode
         self.backend = backend
         self.budget = budget
@@ -80,6 +82,7 @@ class RecursiveCompressionEngine:
         print(f"  Budget: {budget} (Divisor={protection_divisor})")
         print(f"  -> Allocation: Anchor={self.anchor_size} | Local={self.local_window_size} | Global={self.global_budget}")
         print(f"  Selector: {selector_type} (Mode: {lsh_mode})")
+        print(f"  Selector tie-breaker mode: {self.selector_mode}")
         print(f"  Compression Mode: {compression_mode}")
         
         self.validate_config()
@@ -125,7 +128,8 @@ class RecursiveCompressionEngine:
                 lsh_mode=self.lsh_mode, 
                 num_bits=self.num_bits,
                 num_tables=self.num_tables,
-                device=self.device
+                device=self.device,
+                mode=self.selector_mode
             )
         else:
             raise ValueError(f"Unknown selector type: {s_type}")

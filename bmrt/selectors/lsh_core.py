@@ -6,7 +6,7 @@ class LSHSelector(BaseSelector):
     """
     Selects tokens using LSH techniques.
     Supports two modes:
-    1. 'frequency_rank' (Ours): Sort by collision count across tables.
+    1. 'frequency_rank' (Ours): Sort by collision count (Primary) + Attention Score (Secondary).
     2. 'magicpig_baseline': Probabilistic sampling from matching buckets.
     """
     
@@ -121,67 +121,28 @@ class LSHSelector(BaseSelector):
                 
                 hits = bucket_mask[c_h.long()]
                 collision_counts += hits.int()
+            
+            # --- TIE-BREAKING LOGIC RESTORED FROM LSH_SAMPLER ---
+            candidate_scores = kwargs.get('candidate_scores')
+
+            if candidate_scores is not None:
+                # 1. Sort by secondary key (Attention Score) DESC
+                sorted_by_score_indices = torch.argsort(candidate_scores, descending=True)
                 
-            sorted_indices = torch.argsort(collision_counts, descending=True, stable=True)
-            top_k_indices = sorted_indices[:budget]
-            
-        # elif self.lsh_mode == 'magicpig_baseline':
-        #     # MagicPIG: Deterministic Probability-Based Selection
-        #     # Reference: "MagicPIG: LSH Sampling for Efficient LLM Context Compression"
-            
-        #     # 1. Compute Raw Bits
-        #     q_bits = self.compute_bits(centered_query) # [Q, L, K]
-        #     c_bits = self.compute_bits(centered_candidates) # [C, L, K]
-            
-        #     L, K = self.num_tables, self.num_bits
-            
-        #     # 2. Collision Filtering (Matches >= 2 Tables)
-        #     # Expand dimensions for broadcast: [Q, 1, L, K] == [1, C, L, K]
-        #     match_bits = (q_bits.unsqueeze(1) == c_bits.unsqueeze(0)) 
-        #     table_matches = match_bits.all(dim=-1) # [Q, C, L]
-        #     collision_counts = table_matches.sum(dim=-1) # [Q, C]
-            
-        #     # 3. Probability Scoring (u_i)
-        #     # D(q, c) = sum(diff bits) across ALL tables.
-        #     diff_bits = (~match_bits).sum(dim=(-1, -2)) # [Q, C]
-            
-        #     # Probability  p = 1 - D / (L*K)
-        #     total_bits = L * K
-        #     p = 1.0 - (diff_bits.float() / total_bits)
-            
-        #     # Formula: u = 1 - (1 - p^K)^L - L * p^K * (1 - p^K)^(L-1)
-        #     pk = p ** K
-        #     one_minus_pk = 1 - pk
-        #     term2 = one_minus_pk ** L
-        #     term3 = L * pk * (one_minus_pk ** (L - 1))
-            
-        #     u_scores = 1.0 - term2 - term3
-            
-        #     # Filter: Only consider candidates retrieved (>= 2 collisions) by at least one query
-        #     is_retrieved = (collision_counts >= 2)
-        #     u_scores = u_scores * is_retrieved.float() 
-            
-        #     # Candidate Score: Max probability score across any Query token
-        #     final_scores, _ = u_scores.max(dim=0) # [C]
-            
-        #     # 4. Selection
-        #     valid_mask = (final_scores > 0)
-        #     valid_indices_local = torch.nonzero(valid_mask, as_tuple=True)[0]
-        #     valid_scores = final_scores[valid_indices_local]
-            
-        #     if len(valid_indices_local) >= budget:
-        #          _, top_k_local = torch.topk(valid_scores, k=budget)
-        #          top_k_indices = valid_indices_local[top_k_local]
-        #     else:
-        #          # Fallback: Fill remainder with most recent tokens (Temporal Selection)
-        #          needed = budget - len(valid_indices_local)
-                 
-        #          selected_set = set(valid_indices_local.tolist())
-        #          all_local = set(range(len(candidate_indices)))
-        #          remaining = sorted(list(all_local - selected_set), reverse=True) 
-                 
-        #          fallback_local = remaining[:needed]
-        #          top_k_indices = torch.cat([valid_indices_local, torch.tensor(fallback_local, device=self.device)])
+                # 2. Re-order counts based on score sort
+                sorted_counts = collision_counts[sorted_by_score_indices]
+                
+                # 3. Sort by primary key (Collision Counts) DESC using stable sort
+                # This ensures that if counts are equal, the order from step 1 (scores) is preserved
+                sorted_by_count_indices = torch.argsort(sorted_counts, descending=True, stable=True)
+                
+                # 4. Combine to get final indices
+                final_prioritized_indices = sorted_by_score_indices[sorted_by_count_indices]
+                top_k_indices = final_prioritized_indices[:budget]
+            else:
+                # Fallback: Sort purely by collision count if no scores provided
+                sorted_indices = torch.argsort(collision_counts, descending=True, stable=True)
+                top_k_indices = sorted_indices[:budget]
         
         elif self.lsh_mode == 'magicpig_baseline':
             # 1. Compute Hash Bits (Integer form)

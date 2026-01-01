@@ -379,6 +379,7 @@ class RecursiveCompressionEngine:
                 prev_extracted_kv = None
 
             extraction_abs_current = [cache_block_start + idx for idx in all_selected_relative]
+            extraction_indices = extraction_abs_current  # Store for return value
             
             # Extract current block KV from new_kv_cache
             curr_extracted_kv = extract_kv_for_indices(

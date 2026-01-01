@@ -97,13 +97,19 @@ def main(args):
             duration = time.time() - start
 
             prediction = result['text'][0]
-            # print(f"Prediction: {prediction}")
-
+            
             if target.lower() in prediction.lower() or prediction.lower() in target.lower():
                 correct += 1
-                # print("Match: PASS")
+                match_status = "✓ PASS"
             else:
-                pass # print("Match: FAIL")
+                match_status = "✗ FAIL"
+            
+            # Show output and running accuracy after each sample
+            accuracy_so_far = correct / total * 100
+            print(f"\n  Sample {i}: {match_status}")
+            print(f"  Target: {target}")
+            print(f"  Prediction: {prediction.strip()[:200]}{'...' if len(prediction.strip()) > 200 else ''}")
+            print(f"  Running Accuracy: {accuracy_so_far:.2f}% ({correct}/{total})")
 
         except Exception as e:
             print(f"\nError processing sample {i}: {e}")

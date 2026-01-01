@@ -9,6 +9,7 @@ class ExactSelector(BaseSelector):
         self.block_start = 0
         self.block_len = 0
         self.score_history = False
+        self.prev_local_tail_len = 0
         
     def setup(self, model):
         self.accumulator.wrap_model(model)
@@ -16,18 +17,20 @@ class ExactSelector(BaseSelector):
     def cleanup(self):
         self.accumulator.unwrap_model(None) 
         
-    def prepare_block(self, total_seq_len, block_len, query_len, prefix_len, prefix_in_kv, score_history=False):
+    def prepare_block(self, total_seq_len, block_len, query_len, prefix_len, prefix_in_kv, score_history=False, prev_local_tail_len=0):
         self.accumulator.start_block_with_prefix(
             total_seq_len=total_seq_len,
             prefix_len=prefix_len,
             block_len=block_len,
             query_len=query_len,
             prefix_in_kv_cache=prefix_in_kv,
-            score_history=score_history
+            score_history=score_history,
+            prev_local_tail_len=prev_local_tail_len
         )
-        self.block_start = prefix_in_kv
-        self.block_len = block_len
+        self.block_start = prefix_in_kv - prev_local_tail_len
+        self.block_len = block_len + prev_local_tail_len
         self.score_history = score_history
+        self.prev_local_tail_len = prev_local_tail_len
         
     def finish_block(self):
         self.accumulator.finish_block()
@@ -58,6 +61,7 @@ class ExactSelector(BaseSelector):
             for idx in candidate_indices:
                 if block_start <= idx < block_end:
                     filtered_candidates.append(idx)
+                    # Relative position in the scored slice (includes prev tail offset)
                     relative_positions.append(idx - block_start)
             if not relative_positions:
                 return []

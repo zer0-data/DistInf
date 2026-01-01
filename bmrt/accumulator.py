@@ -31,6 +31,7 @@ class AttentionScoreAccumulator:
         query_len: int,
         prefix_in_kv_cache: int = 0,
         score_history: bool = False,
+        prev_local_tail_len: int = 0,
     ):
         self.reset()
         self.is_active = True
@@ -41,6 +42,7 @@ class AttentionScoreAccumulator:
         self.prefix_in_kv_cache = prefix_in_kv_cache
         self.expected_q_len = total_seq_len
         self.score_history = score_history
+        self.prev_local_tail_len = prev_local_tail_len
 
     def accumulate(self, attn_weights: torch.Tensor, layer_idx: int):
         if not self.is_active:
@@ -63,8 +65,9 @@ class AttentionScoreAccumulator:
             block_start_in_kv = 0
             block_end_in_kv = self.prefix_in_kv_cache + self.block_token_count
         else:
-            # Score only the current block (Standard)
-            block_start_in_kv = self.prefix_in_kv_cache
+            # In accumulate mode, score both previous tail AND new block
+            # to allow fair re-selection of previous tail tokens
+            block_start_in_kv = self.prefix_in_kv_cache - self.prev_local_tail_len
             block_end_in_kv = self.prefix_in_kv_cache + self.block_token_count
         
         if self.query_len > 0:

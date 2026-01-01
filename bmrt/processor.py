@@ -223,6 +223,7 @@ class RecursiveCompressionEngine:
         
         # Prepare Selector (for eager exact accumulator)
         score_history = (self.compression_mode == 'recursive')
+        prev_tail_len = 0 if score_history else self.prev_local_tail_len
         if hasattr(self.selector, 'prepare_block'):
             self.selector.prepare_block(
                 total_seq_len=total_input_len,
@@ -230,7 +231,8 @@ class RecursiveCompressionEngine:
                 block_len=block_len,
                 query_len=query_len,
                 prefix_in_kv=temp_prefix_cache_len,
-                score_history=score_history
+                score_history=score_history,
+                prev_local_tail_len=prev_tail_len
             )
 
         from .patch_fa import ApplyFlashAttentionPatch

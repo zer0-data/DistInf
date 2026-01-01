@@ -14,7 +14,7 @@ class LSHSelector(BaseSelector):
     named 'attention_it' and uses attention scores as a secondary stable key.
     """
     
-    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda', mode: str = 'attention_it'):
+    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda', mode: str = 'l2'):
         self.head_dim = head_dim
         self.num_bits = num_bits
         self.num_tables = num_tables

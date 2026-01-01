@@ -65,15 +65,45 @@ To avoid $O(N^2)$ compute, we use **Locality Sensitive Hashing (LSH)**.
 
 #### Mode A: Frequency Rank (Ours)
 *   We use multiple hash tables (SimHash).
-*   We count exactly how many times a candidate collides with *any* query token.
-*   We sort candidates by `(Collision_Count, Attention_Score)` and pick the top.
-#### Mode A: Frequency Rank (Ours)
-*   We use multiple hash tables (SimHash).
 *   We count exactly how many times a candidate collides with *any* query token (Collision_Count).
-*   Selection sorts primarily by `Collision_Count`. A configurable tie-breaking hyperparameter `mode` controls secondary ordering:
-    - `l2`: use the L2 (Euclidean) distance between the candidate vector and the (mean) query vector as the secondary key (lower is better).
-    - `none`: no secondary key; pure collision-count ordering.
-*   Decoupling tie-breaking from the primary LSH ranking allows experimenting with alternative heuristics (e.g., distance-based) without changing the collision counting logic.
+*   Selection sorts primarily by `Collision_Count` (descending). A configurable tie-breaking hyperparameter `mode` controls secondary ordering when collision counts are equal.
+*   Decoupling tie-breaking from the primary LSH ranking allows experimenting with alternative heuristics without changing the collision counting logic.
+
+##### Tie-Breaking Strategies for Frequency Rank
+
+When multiple candidates have the same collision count, the following tie-breaker modes determine their final order:
+
+**1. `l2` (L2 Distance to Mean Query)**
+- **Method**: Compute the mean of all query vectors, then rank candidates by Euclidean distance to this mean.
+- **Pros**: Simple, interpretable, low computational cost (O(C·D)).
+- **Cons**: Loses sequence structure by averaging; poor for diverse, multi-topic queries; biased toward mid-range vectors.
+- **Best for**: Focused, unimodal queries with coherent semantics.
+
+**2. `max_sim` (Maximum Pairwise Similarity)**
+- **Method**: For each candidate, compute its distance to *every* query token and take the minimum distance. Rank by this min-distance.
+- **Pros**: Captures "best-case relevance"; handles diverse queries; avoids centroid curse; finds local matches.
+- **Cons**: Computationally expensive (O(Q·C) distance matrix); can favor outlier matches; memory-heavy with `torch.cdist`.
+- **Best for**: Hybrid scenarios (especially Exact + LSH); capturing query diversity.
+
+**3. `mahalanobis` (Variance-Weighted Distance)**
+- **Method**: Compute query mean and variance, then rank candidates by weighted distance: $$d = \sqrt{\sum_d \frac{(c_d - \mu_d)^2}{\sigma_d^2}}$$
+- **Pros**: Statistical grounding with second-order information; adapts to query variance; penalizes outliers more heavily; similar cost to `l2` (O(C·D)).
+- **Cons**: Assumes Gaussian distribution (embeddings aren't Gaussian); uses diagonal covariance only; unstable with short queries; numerical sensitivity in low-variance dimensions.
+- **Best for**: Coherent, variance-aware queries; statistical selection scenarios.
+
+**4. `partitioned_centroid` (Multi-View Partition Centroids)**
+- **Method**: Partition the query into k chunks (where k = max(1, Q/16), capped at 8), compute a centroid for each chunk, then rank candidates by minimum distance to any centroid.
+- **Pros**: Captures temporal query structure; auto-scales with query length; balances cost (O(C·k) with k ≤ 8) vs. precision; avoids single-centroid collapse; handles long diverse queries.
+- **Cons**: Arbitrary partitioning may not align with semantic boundaries; boundary effects at partition edges; still lossy (multiple centroids); hyperparameters (chunk size, k-cap) are fixed.
+- **Best for**: Long-sequence queries; temporal structure preservation; scenarios requiring multi-view relevance.
+
+**5. `none` (Pure Collision Count, No Tie-Breaking)**
+- **Method**: Sort candidates purely by collision count with no secondary ranking. Ties are broken arbitrarily by the stable sort.
+- **Pros**: Maximum speed (O(1) per candidate); pure LSH semantics with no contamination; cache-friendly; fully reproducible.
+- **Cons**: Loses all tie-breaking information; LSH approximation errors exposed; all-or-nothing ranking; brittle to poor hash functions; tends toward low diversity.
+- **Best for**: Speed-critical applications with very large candidate pools; when LSH collision count is sufficiently informative.
+
+
 
 #### Mode B: MagicPIG Baseline
 *   **Deterministic Probability Scoring**: Instead of random sampling, we assign a theoretical selection probability $u_i$ to each token $i$ based on its Hamming Distance $D(q, k)$ from the query.

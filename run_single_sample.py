@@ -156,7 +156,7 @@ if __name__ == '__main__':
     parser.add_argument('--model_path', default='meta-llama/Llama-3.1-8B-Instruct')
     parser.add_argument('--method', default='exact', choices=['exact', 'lsh', 'hybrid'])
     parser.add_argument('--lsh_mode', default='frequency_rank', choices=['frequency_rank', 'magicpig_baseline'])
-    parser.add_argument('--mode', default='l2', choices=['l2', 'none'], help='Tie-breaker mode for LSHSelector')
+    parser.add_argument('--mode', default='l2', choices=['l2', 'max_sim', 'mahalanobis', 'partitioned_centroid', 'none'], help='Tie-breaker mode for LSHSelector')
     parser.add_argument('--compression_mode', default='accumulate', choices=['accumulate', 'recursive'])
     parser.add_argument('--backend', default='eager', choices=['eager', 'flash'])
     parser.add_argument('--budget', type=int, default=2048)

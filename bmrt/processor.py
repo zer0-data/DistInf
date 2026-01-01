@@ -24,7 +24,7 @@ class RecursiveCompressionEngine:
         model_path: str,
         selector_type: str = 'exact', # 'exact', 'lsh', or 'hybrid'
         lsh_mode: str = 'frequency_rank', # 'frequency_rank' or 'magicpig_baseline'
-        selector_mode: str = 'l2', # tie-breaker: 'l2' or 'none'
+        selector_mode: str = 'l2', # tie-breaker: 'l2','max_sim','mahalanobis','partitioned_centroid','none'
         compression_mode: str = 'accumulate', # 'accumulate' or 'recursive'
         backend: str = 'eager', # 'eager' or 'flash'
         budget: int = 4096, # Total budget

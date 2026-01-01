@@ -22,7 +22,7 @@ class LSHSelector(BaseSelector):
         self.lsh_mode = lsh_mode
         # Tie-breaking mode (hyperparameter)
         self.mode = mode
-        if mode not in ['l2', 'none']:
+        if mode not in ['l2', 'max_sim', 'mahalanobis', 'partitioned_centroid', 'none']:
             raise ValueError(f"Invalid tie-breaking mode: {mode}")
         if lsh_mode not in ['frequency_rank', 'magicpig_baseline']:
             raise ValueError(f"Invalid lsh_mode: {lsh_mode}")
@@ -132,15 +132,11 @@ class LSHSelector(BaseSelector):
             
             # --- TIE-BREAKING LOGIC (controlled via `self.mode`) ---
             
-            # If mode is 'l2', use L2 (Euclidean) distance to the query
-            # as a secondary key (ascending). Otherwise fall back to
-            # sorting by collision count only.
+            # If mode is 'l2' or 'max_sim', use distance-based secondary sorting.
+            # Otherwise fall back to sorting by collision count only.
             if self.mode == 'l2':
-                # Compute L2 distances between the (mean) query vector and candidates.
-                # Use the mean of query_vectors if multiple query vectors are present.
-                # centered_query: [Q, D] -> take mean -> [D]
+                # Original approach: L2 distance to the mean query vector
                 q_vec = centered_query.mean(dim=0, keepdim=True)
-                # centered_candidates: [C, D]
                 dists = torch.norm(centered_candidates - q_vec, dim=1)
 
                 # 1. Sort by secondary key (L2 distance) ASC
@@ -155,6 +151,99 @@ class LSHSelector(BaseSelector):
                 # 4. Combine to get final indices
                 final_prioritized_indices = sorted_by_dist_indices[sorted_by_count_indices]
                 top_k_indices = final_prioritized_indices[:budget]
+            
+            elif self.mode == 'max_sim':
+                # New approach: Pairwise L2 distances with max similarity (min distance)
+                # centered_query: [Q, D], centered_candidates: [C, D]
+                # Compute pairwise L2 distance matrix: [Q, C]
+                # Using torch.cdist for memory-efficient computation
+                dist_matrix = torch.cdist(centered_query, centered_candidates, p=2.0)
+                
+                # For each candidate, find the minimum distance to any query token
+                # This represents the candidate's similarity to the "most similar" query
+                min_dists, _ = torch.min(dist_matrix, dim=0)  # [C]
+                
+                # 1. Sort by secondary key (min distance) ASC
+                sorted_by_dist_indices = torch.argsort(min_dists, descending=False)
+
+                # 2. Re-order counts based on distance sort
+                sorted_counts = collision_counts[sorted_by_dist_indices]
+
+                # 3. Sort by primary key (Collision Counts) DESC using stable sort
+                sorted_by_count_indices = torch.argsort(sorted_counts, descending=True, stable=True)
+
+                # 4. Combine to get final indices
+                final_prioritized_indices = sorted_by_dist_indices[sorted_by_count_indices]
+                top_k_indices = final_prioritized_indices[:budget]
+            
+            elif self.mode == 'mahalanobis':
+                # Mahalanobis distance using query variance as weighting
+                # centered_query: [Q, D], centered_candidates: [C, D]
+                # Compute mean and variance of query tokens along sequence dimension
+                q_mean = centered_query.mean(dim=0)  # [D]
+                q_var = centered_query.var(dim=0)    # [D]
+                
+                # Small epsilon to avoid division by zero
+                epsilon = 1e-8
+                
+                # Compute weighted squared differences: sum((c - mu)^2 / (sigma^2 + eps))
+                # centered_candidates: [C, D], q_mean: [D]
+                diff = centered_candidates - q_mean.unsqueeze(0)  # [C, D]
+                weighted_diff_sq = (diff ** 2) / (q_var.unsqueeze(0) + epsilon)  # [C, D]
+                mahal_dists = torch.sqrt(weighted_diff_sq.sum(dim=1))  # [C]
+                
+                # 1. Sort by secondary key (Mahalanobis distance) ASC
+                sorted_by_dist_indices = torch.argsort(mahal_dists, descending=False)
+
+                # 2. Re-order counts based on distance sort
+                sorted_counts = collision_counts[sorted_by_dist_indices]
+
+                # 3. Sort by primary key (Collision Counts) DESC using stable sort
+                sorted_by_count_indices = torch.argsort(sorted_counts, descending=True, stable=True)
+
+                # 4. Combine to get final indices
+                final_prioritized_indices = sorted_by_dist_indices[sorted_by_count_indices]
+                top_k_indices = final_prioritized_indices[:budget]
+            
+            elif self.mode == 'partitioned_centroid':
+                # Partitioned centroid: Split query into k chunks, compute centroid per chunk,
+                # then find minimum distance to any partition centroid
+                # centered_query: [Q, D], centered_candidates: [C, D]
+                
+                # Determine partition count dynamically based on query length
+                Q = centered_query.shape[0]
+                k = max(1, Q // 16)
+                # Cap k at a reasonable maximum
+                k = min(k, 8)
+                
+                # Split query vectors into k chunks and compute centroid for each chunk
+                # torch.chunk returns a list of tensors
+                query_chunks = torch.chunk(centered_query, chunks=k, dim=0)
+                
+                # Compute mean vector for each chunk: [k, D]
+                partition_centroids = torch.stack([chunk.mean(dim=0) for chunk in query_chunks], dim=0)  # [k, D]
+                
+                # Compute distance matrix between candidates and partition centroids
+                # centered_candidates: [C, D], partition_centroids: [k, D]
+                # dist_matrix: [C, k] via torch.cdist
+                dist_matrix = torch.cdist(centered_candidates, partition_centroids, p=2.0)  # [C, k]
+                
+                # For each candidate, find the minimum distance to any partition centroid
+                min_partition_dists, _ = torch.min(dist_matrix, dim=1)  # [C]
+                
+                # 1. Sort by secondary key (min partition distance) ASC
+                sorted_by_dist_indices = torch.argsort(min_partition_dists, descending=False)
+
+                # 2. Re-order counts based on distance sort
+                sorted_counts = collision_counts[sorted_by_dist_indices]
+
+                # 3. Sort by primary key (Collision Counts) DESC using stable sort
+                sorted_by_count_indices = torch.argsort(sorted_counts, descending=True, stable=True)
+
+                # 4. Combine to get final indices
+                final_prioritized_indices = sorted_by_dist_indices[sorted_by_count_indices]
+                top_k_indices = final_prioritized_indices[:budget]
+            
             else:
                 # Default/fallback: Sort purely by collision count (stable)
                 sorted_indices = torch.argsort(collision_counts, descending=True, stable=True)

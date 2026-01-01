@@ -327,6 +327,14 @@ class RecursiveCompressionEngine:
              kept_relative_indices = [idx - prefix_cache_len for idx in all_selected_indices_absolute if idx >= prefix_cache_len]
              summary_ids = block_ids.index_select(dim=1, index=torch.tensor(kept_relative_indices, device=self.device))
              
+             # Extract KV for the selected absolute indices from new_kv_cache
+             extracted_kv = extract_kv_for_indices(
+                 new_kv_cache,
+                 extraction_indices,
+                 offset=extraction_offset,
+                 device=self.device
+             )
+             
         else:
             # Standard Accumulate behavior
             # selected_indices_only contains absolute indices into new_kv_cache
@@ -355,20 +363,33 @@ class RecursiveCompressionEngine:
             all_selected_relative = [idx for idx in all_selected_relative if 0 <= idx < block_len]
             summary_ids = block_ids.index_select(dim=1, index=torch.tensor(all_selected_relative, device=self.device))
 
-            # Extract KV for both prev-selected absolutes and current-block kept absolutes
+            # Extract KV from two sources:
+            # 1. prev_selected_abs must be extracted from self.prev_local_tail_kv (not new_kv_cache)
+            # 2. current block indices are extracted from new_kv_cache
+            if prev_selected_abs:
+                # Convert prev_selected_abs (absolute into temp_prefix_kv) to relative indices into prev_local_tail_kv
+                prev_selected_relative_tail = [si - prefix_cache_len for si in prev_selected_abs]
+                prev_extracted_kv = extract_kv_for_indices(
+                    self.prev_local_tail_kv,
+                    prev_selected_relative_tail,
+                    offset=0,
+                    device=self.device
+                )
+            else:
+                prev_extracted_kv = None
+
             extraction_abs_current = [cache_block_start + idx for idx in all_selected_relative]
-            extraction_indices = []
-            extraction_indices.extend(prev_selected_abs)
-            extraction_indices.extend(extraction_abs_current)
-            extraction_offset = 0
-        
-        # Extract KV for the selected absolute indices from new_kv_cache
-        extracted_kv = extract_kv_for_indices(
-            new_kv_cache,
-            extraction_indices,
-            offset=extraction_offset,
-            device=self.device
-        )
+            
+            # Extract current block KV from new_kv_cache
+            curr_extracted_kv = extract_kv_for_indices(
+                new_kv_cache,
+                extraction_abs_current,
+                offset=0,
+                device=self.device
+            )
+            
+            # Merge prev-selected and current-block extracted KVs
+            extracted_kv = merge_kv_caches(prev_extracted_kv, curr_extracted_kv)
 
         # Store current block's local tail KV for use by the next block's selection.
         # We do NOT merge this tail into the accumulated cache now; it will only be

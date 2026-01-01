@@ -27,6 +27,9 @@ class ExactSelector(BaseSelector):
             score_history=score_history,
             prev_local_tail_len=prev_local_tail_len
         )
+        # In accumulate mode, block_start covers the previous tail so that
+        # candidates from the tail (absolute indices starting at prefix_in_kv - prev_local_tail_len)
+        # are included in the scorable range. block_len is extended to cover both tail + new block.
         self.block_start = prefix_in_kv - prev_local_tail_len
         self.block_len = block_len + prev_local_tail_len
         self.score_history = score_history
@@ -54,6 +57,9 @@ class ExactSelector(BaseSelector):
             filtered_candidates = candidate_indices
             relative_positions = candidate_indices
         else:
+            # In accumulate mode, block_start = prefix_cache_len (start of prev tail)
+            # and block_end = prefix_cache_len + prev_local_tail_len + block_len
+            # This ensures both previous tail tokens and current block tokens are scorable.
             block_start = self.block_start
             block_end = block_start + self.block_len
             relative_positions = []
@@ -61,7 +67,9 @@ class ExactSelector(BaseSelector):
             for idx in candidate_indices:
                 if block_start <= idx < block_end:
                     filtered_candidates.append(idx)
-                    # Relative position in the scored slice (includes prev tail offset)
+                    # Relative position in the scored slice:
+                    # - Tail tokens: idx - block_start gives 0..prev_local_tail_len-1
+                    # - Block tokens: idx - block_start gives prev_local_tail_len..prev_local_tail_len+block_len-1
                     relative_positions.append(idx - block_start)
             if not relative_positions:
                 return []

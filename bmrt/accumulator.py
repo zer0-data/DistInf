@@ -39,7 +39,7 @@ class AttentionScoreAccumulator:
         self.block_token_count = block_len
         self.query_len = query_len
         self.prefix_in_kv_cache = prefix_in_kv_cache
-        self.expected_q_len = total_seq_len - prefix_in_kv_cache
+        self.expected_q_len = total_seq_len
         self.score_history = score_history
 
     def accumulate(self, attn_weights: torch.Tensor, layer_idx: int):

@@ -24,7 +24,7 @@ class RecursiveCompressionEngine:
         model_path: str,
         selector_type: str = 'exact', # 'exact', 'lsh', or 'hybrid'
         lsh_mode: str = 'frequency_rank', # 'frequency_rank' or 'magicpig_baseline'
-        selector_mode: str = 'attention_it', # tie-breaker: 'attention_it', 'l2', or 'none'
+        selector_mode: str = 'l2', # tie-breaker: 'attention_it', 'l2', or 'none'
         compression_mode: str = 'accumulate', # 'accumulate' or 'recursive'
         backend: str = 'eager', # 'eager' or 'flash'
         budget: int = 4096, # Total budget
@@ -265,7 +265,9 @@ class RecursiveCompressionEngine:
             # Build absolute candidate indices list
             if self.compression_mode == 'recursive':
                 # For recursive, use history logic (absolute indices)
-                cand_abs_indices = [prefix_cache_len + idx for idx in candidate_indices]
+                # Include all non-anchor tokens from history as candidates for re-evaluation
+                history_candidates = list(range(self.anchor_size, prefix_cache_len))
+                cand_abs_indices = history_candidates + [prefix_cache_len + idx for idx in candidate_indices]
             else:
                 cand_abs_indices = []
                 # Include previous local tail absolute indices if present

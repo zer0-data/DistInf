@@ -50,6 +50,22 @@ while [[ $# -gt 0 ]]; do
       BLOCK_SIZE="$2"
       shift 2
       ;;
+    --dynamic)
+      DYNAMIC_ARGS="${DYNAMIC_ARGS:-} --dynamic"
+      shift
+      ;;
+    --alpha)
+      DYNAMIC_ARGS="${DYNAMIC_ARGS:-} --alpha $2"
+      shift 2
+      ;;
+    --beta)
+      DYNAMIC_ARGS="${DYNAMIC_ARGS:-} --beta $2"
+      shift 2
+      ;;
+    --target_quality)
+      DYNAMIC_ARGS="${DYNAMIC_ARGS:-} --target_quality $2"
+      shift 2
+      ;;
     --help)
       usage
       ;;
@@ -126,7 +142,7 @@ for cfg in "${CONFIGS[@]}"; do
       echo "--- Method: Exact ---"
       run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
         --method exact --backend eager --budget $BUDGET --compression_mode recursive \
-        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 2) LSH: frequency_rank (flash)
@@ -135,7 +151,7 @@ for cfg in "${CONFIGS[@]}"; do
       echo "--- Method: LSH (Frequency Rank) ---"
       run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
         --method lsh --lsh_mode frequency_rank --backend flash --budget $BUDGET --compression_mode recursive \
-        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 3) LSH: magicpig_baseline (flash)
@@ -144,7 +160,7 @@ for cfg in "${CONFIGS[@]}"; do
       echo "--- Method: LSH (MagicPIG) ---"
       run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
         --method lsh --lsh_mode magicpig_baseline --backend flash --budget $BUDGET --compression_mode recursive \
-        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 4) Hybrid: Exact + FreqRank
@@ -155,7 +171,7 @@ for cfg in "${CONFIGS[@]}"; do
       run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
         --method hybrid --hybrid_primary exact --hybrid_secondary lsh --lsh_mode frequency_rank \
         --hybrid_ratio 0.5 --backend eager --budget $BUDGET --compression_mode recursive \
-        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 0.75
@@ -165,7 +181,7 @@ for cfg in "${CONFIGS[@]}"; do
       run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
         --method hybrid --hybrid_primary exact --hybrid_secondary lsh --lsh_mode frequency_rank \
         --hybrid_ratio 0.75 --backend eager --budget $BUDGET --compression_mode recursive \
-        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
       
     ID="hybrid_freq_exact_0.75"
@@ -174,7 +190,7 @@ for cfg in "${CONFIGS[@]}"; do
       run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
         --method hybrid --hybrid_primary lsh --hybrid_secondary exact --lsh_mode frequency_rank \
         --hybrid_ratio 0.75 --backend eager --budget $BUDGET --compression_mode recursive \
-        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+        --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 5) Hybrid: Exact + MagicPIG
@@ -185,7 +201,7 @@ for cfg in "${CONFIGS[@]}"; do
         run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
           --method hybrid --hybrid_primary exact --hybrid_secondary lsh --lsh_mode magicpig_baseline \
           --hybrid_ratio 0.5 --backend eager --budget $BUDGET --compression_mode recursive \
-          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 0.75
@@ -195,7 +211,7 @@ for cfg in "${CONFIGS[@]}"; do
         run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
           --method hybrid --hybrid_primary exact --hybrid_secondary lsh --lsh_mode magicpig_baseline \
           --hybrid_ratio 0.75 --backend eager --budget $BUDGET --compression_mode recursive \
-          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     ID="hybrid_magic_exact_0.75"
@@ -204,7 +220,7 @@ for cfg in "${CONFIGS[@]}"; do
         run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
           --method hybrid --hybrid_primary lsh --hybrid_secondary exact --lsh_mode magicpig_baseline \
           --hybrid_ratio 0.75 --backend eager --budget $BUDGET --compression_mode recursive \
-          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 6) Hybrid: MagicPIG + FreqRank
@@ -215,7 +231,7 @@ for cfg in "${CONFIGS[@]}"; do
         run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
           --method hybrid --hybrid_primary lsh --hybrid_secondary lsh --lsh_mode magicpig_baseline \
           --hybrid_ratio 0.5 --backend flash --budget $BUDGET --compression_mode recursive \
-          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
     ID="hybrid_freq_magic_0.5"
     if should_run "$ID" "$TARGET_METHOD"; then
@@ -223,7 +239,7 @@ for cfg in "${CONFIGS[@]}"; do
         run_cmd $PY run_single_sample.py --model_path "$MODEL_PATH" \
           --method hybrid --hybrid_primary lsh --hybrid_secondary lsh --lsh_mode frequency_rank \
           --hybrid_ratio 0.5 --backend flash --budget $BUDGET --compression_mode recursive \
-          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES"
+          --dataset_config $cfg --dataset_split $task --block_size "$BLOCK_SIZE" --num_samples "$NUM_SAMPLES" ${DYNAMIC_ARGS:-}
     fi
 
     # 0.75

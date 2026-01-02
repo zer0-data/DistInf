@@ -57,6 +57,10 @@ def main(args):
                 hybrid_primary=args.hybrid_primary,
                 hybrid_secondary=args.hybrid_secondary,
                 hybrid_ratio=args.hybrid_ratio,
+                dynamic_mode=args.dynamic,
+                dynamic_alpha=args.alpha,
+                dynamic_beta=args.beta,
+                dynamic_tau=args.target_quality,
             )
             # print("Engine loaded successfully.")
             return eng
@@ -181,6 +185,12 @@ if __name__ == '__main__':
     parser.add_argument('--num_samples', type=int, default=100)
     parser.add_argument('--top_k', type=int, default=0, help="Unused but kept for compatibility")
     parser.add_argument('--results_file', default='accuracies.txt', help='File to append accuracy results')
+    
+    # Dynamic Compression args
+    parser.add_argument('--dynamic', action='store_true', help="Enable dynamic compression based on NLL")
+    parser.add_argument('--alpha', type=float, default=0.0, help="Dynamic compression alpha parameter")
+    parser.add_argument('--beta', type=float, default=0.0, help="Dynamic compression beta parameter")
+    parser.add_argument('--target_quality', type=float, default=0.95, help="Target quality (tau) for dynamic compression")
     
     args = parser.parse_args()
     main(args)

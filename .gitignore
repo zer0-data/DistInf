@@ -5,3 +5,5 @@ uv.lock
 __pycache__/
 hf_token
 modal_entry.py
+
+modal_train_dynamic.py

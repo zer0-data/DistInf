@@ -39,6 +39,11 @@ class RecursiveCompressionEngine:
         hybrid_primary: str = 'exact',
         hybrid_secondary: str = 'lsh',
         hybrid_ratio: float = 0.5,
+        # Dynamic Config
+        dynamic_mode: bool = False,
+        dynamic_alpha: float = 0.0,
+        dynamic_beta: float = 0.0,
+        dynamic_tau: float = 0.95,
     ):
         
         self.model_path = model_path
@@ -54,6 +59,12 @@ class RecursiveCompressionEngine:
         self.stop_words = stop_words or []
         self.num_bits = num_bits
         self.num_tables = num_tables
+        
+        # Dynamic params
+        self.dynamic_mode = dynamic_mode
+        self.dynamic_alpha = dynamic_alpha
+        self.dynamic_beta = dynamic_beta
+        self.dynamic_tau = dynamic_tau
         
         # Valid modes
         if compression_mode not in ['accumulate', 'recursive']:
@@ -452,9 +463,135 @@ class RecursiveCompressionEngine:
             text = text.split(stop_word)[0]
         return text.strip()
 
+    @torch.no_grad()
+    def _measure_nll(self, context_ids: torch.Tensor) -> float:
+        """
+        Measures the NLL of the context using a sliding window approach to avoid OOM
+        on very large contexts, though for many standard benchmarks full-forward might work.
+        We'll use a safer sliding window or chunked approach.
+        """
+        # For simplicity and standard behavior, we use the model's loss calculation.
+        # Ideally, we should just run forward on the whole thing if it fits.
+        # Let's try to run forward on the whole context. If it implies OOM, we might need a fail-safe.
+        # Given this is "distinf", maybe we assume A100 80G?
+        
+        # We start from token 0? NLL is P(x_i | x_<i).
+        # We need to shift labels.
+        
+        # Check size
+        seq_len = context_ids.shape[1]
+        
+        # If very large, doing it in one go might be risky. 
+        # But 'babilong' can be 16k, 32k. Llama-3-8B fits 16k easily. 32k might be tight in fp16.
+        # Let's implement a chunked NLL if needed, but simple is better first.
+        try:
+           outputs = self.model(input_ids=context_ids, labels=context_ids)
+           return outputs.loss.item()
+        except RuntimeError as e:
+           if "out of memory" in str(e).lower():
+                torch.cuda.empty_cache()
+                print("  Warning: OOM during NLL calculation. Switching to chunked evaluation.")
+                # Fallback to chunked
+                nlls = []
+                stride = 4096
+                max_len = 8192 # Context window for NLL calc
+                
+                # Note: Computing exact NLL on long sequences without full context is an approximation.
+                # However, usually local NLL is good enough.
+                # We will slide a window.
+                total_loss = 0
+                count = 0
+                
+                for i in range(0, seq_len, stride):
+                    end = min(i + max_len, seq_len)
+                    start = max(0, end - max_len)
+                    # We only care about loss for tokens [i, end) (roughly)
+                    # Actually, let's just use non-overlapping blocks with some overlap for context?
+                    # Simpler: just average loss of blocks.
+                    
+                    chunk = context_ids[:, start:end]
+                    chunk_labels = chunk.clone()
+                    if start > 0:
+                         # Mask out the overlap labels so we don't double count?
+                         # Or just approximate.
+                         pass
+                    
+                    out = self.model(input_ids=chunk, labels=chunk_labels)
+                    # This loss is averaged over the chunk.
+                    # We'll take it as a sample.
+                    nlls.append(out.loss.item())
+                    
+                return sum(nlls) / len(nlls) if nlls else 0.0
+           else:
+               raise e
+
+    def _calculate_retention(self, nll_val: float) -> float:
+        # b = alpha * NLL + beta
+        alpha = self.dynamic_alpha
+        beta = self.dynamic_beta
+        tau = self.dynamic_tau
+        
+        b = alpha * nll_val + beta
+        
+        # f(r) \approx tau
+        # r = 1 + (1/b) * ln( tau * (1 - e^-b) + e^-b )
+        
+        # Avoid division by zero if b is very small
+        if abs(b) < 1e-6:
+             # Limit b->0 is r = tau
+             r = tau
+        else:
+            exp_neg_b = torch.exp(torch.tensor(-b)).item()
+            arg = tau * (1 - exp_neg_b) + exp_neg_b
+            
+            if arg <= 0:
+                # Should essentially not happen if tau > 0, but safety first
+                r = 0.0
+            else:
+                val = torch.log(torch.tensor(arg)).item()
+                r = 1 + (val / b)
+                
+        # Clamp r to (0, 1] - usually we imply a lower bound (e.g. at least keeps anchors?)
+        # But mathematically:
+        r = max(0.01, min(1.0, r))
+        print(f"  Dynamic NLL={nll_val:.4f} -> b={b:.4f} -> Target r={r:.4f} (Budget needs ~{int(r * 100)}%)")
+        return r
+
+    def _configure_budget(self, new_budget: int):
+        self.budget = new_budget
+        self.anchor_size = self.budget // self.protection_divisor
+        self.local_window_size = self.budget // self.protection_divisor
+        self.global_budget = self.budget - (self.anchor_size + self.local_window_size)
+        
+        if self.global_budget < 0:
+             # Fallback if budget is too small
+             print("  Warning: Dynamic budget too small for protection divisor. Forcing minimal global budget.")
+             self.global_budget = 0
+             self.anchor_size = self.budget // 2
+             self.local_window_size = self.budget - self.anchor_size
+
     def __call__(self, prompt_context: str, prompt_query: str) -> Dict[str, List[str]]:
         context_ids = self._tokenize(prompt_context)
         query_ids = self._tokenize_query_with_chat_template(prompt_query)
+        
+        # Dynamic Compression Step
+        if self.dynamic_mode:
+             print("  Measuring NLL for Dynamic Compression...")
+             nll = self._measure_nll(context_ids)
+             r = self._calculate_retention(nll)
+             
+             total_tokens = context_ids.shape[1]
+             new_budget = int(r * total_tokens)
+             # Ensure reasonable bounds? We might want to cap it at some max or the original budget?
+             # The prompt implies we determine retention to meet quality. If retention > 1 (impossible) or retention high,
+             # we might want to respect a global memory limit?
+             # For now, we trust r * L, but maybe clamp to 16k or something if needed?
+             # Let's just use r * L w/ a minimum.
+             new_budget = max(256, new_budget) 
+             
+             print(f"  Adjusting Budget: {self.budget} -> {new_budget} (r={r:.2f}, L={total_tokens})")
+             self._configure_budget(new_budget)
+
         blocks = self._split_into_blocks(context_ids)
         
         print(f"Split into {len(blocks)} blocks. Processing...")

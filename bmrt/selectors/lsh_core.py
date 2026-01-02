@@ -14,12 +14,13 @@ class LSHSelector(BaseSelector):
     or no tie-breaking at all.
     """
     
-    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda', mode: str = 'l2'):
+    def __init__(self, head_dim: int, lsh_mode: str = 'frequency_rank', num_bits: int = 12, num_tables: int = 20, device: str = 'cuda', mode: str = 'l2', dtype: torch.dtype = torch.bfloat16):
         self.head_dim = head_dim
         self.num_bits = num_bits
         self.num_tables = num_tables
         self.device = device
         self.lsh_mode = lsh_mode
+        self.dtype = dtype
         # Tie-breaking mode (hyperparameter)
         self.mode = mode
         if mode not in ['l2', 'max_sim', 'mahalanobis', 'partitioned_centroid', 'none']:
@@ -29,11 +30,12 @@ class LSHSelector(BaseSelector):
 
         # Initialize LSH Projections
         # Matrix: [D, num_tables * num_bits]
+        # Match dtype with model (typically bfloat16) to avoid casting overhead
         self.projection_matrix = torch.randn(
             head_dim, 
             num_tables * num_bits, 
             device=device, 
-            dtype=torch.float32  # Will cast during matmul if needed
+            dtype=dtype
         )
         
         # Pre-compute powers of two for hashing
@@ -57,7 +59,8 @@ class LSHSelector(BaseSelector):
             bits: [N, L, K] (0/1 tensor)
         """
         # 1. Project: [N, D] @ [D, L*K] -> [N, L*K]
-        projections = torch.matmul(vectors, self.projection_matrix.to(dtype=vectors.dtype))
+        # Projection matrix is already in the correct dtype (bfloat16 or as configured)
+        projections = torch.matmul(vectors, self.projection_matrix)
         
         # 2. Binarize: [N, L*K] -> 0/1
         bits = (projections > 0).long()
@@ -120,11 +123,14 @@ class LSHSelector(BaseSelector):
             # Our Method: Collision Counting
             collision_counts = torch.zeros(len(candidate_indices), device=self.device, dtype=torch.int32)
             
+            # Allocate bucket_mask once outside the loop to avoid repeated allocations
+            bucket_mask = torch.zeros(num_buckets, device=self.device, dtype=torch.bool)
+            
             for l in range(self.num_tables):
                 q_h = q_hashes[:, l]
                 c_h = c_hashes[:, l]
                 
-                bucket_mask = torch.zeros(num_buckets, device=self.device, dtype=torch.bool)
+                bucket_mask.zero_()  # Reuse tensor, reset in-place
                 bucket_mask.index_fill_(0, q_h.long(), True)
                 
                 hits = bucket_mask[c_h.long()]

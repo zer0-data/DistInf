@@ -108,20 +108,28 @@ class LSHSelector(BaseSelector):
         num_buckets = 2 ** self.num_bits
         
         if self.lsh_mode == 'frequency_rank':
-            collision_counts = torch.zeros(len(candidate_indices), device=self.device, dtype=torch.int32)
+            # Vectorized Collision Counting
+            # 1. Create global bucket indices by adding offsets to each table's hash codes
+            #    This effectively flattens the tables into one large address space.
+            offsets = torch.arange(self.num_tables, device=self.device) * num_buckets
             
-            bucket_mask = torch.zeros(num_buckets, device=self.device, dtype=torch.bool)
-            bucket_mask = torch.zeros(num_buckets, device=self.device, dtype=torch.bool)
+            q_global = q_hashes + offsets.view(1, -1)
+            c_global = c_hashes + offsets.view(1, -1)
             
-            for l in range(self.num_tables):
-                q_h = q_hashes[:, l]
-                c_h = c_hashes[:, l]
-                
-                bucket_mask.zero_()  # Reuse tensor, reset in-place
-                bucket_mask.index_fill_(0, q_h.long(), True)
-                
-                hits = bucket_mask[c_h.long()]
-                collision_counts += hits.int()
+            # 2. Mark active buckets in a single global mask
+            total_buckets = self.num_tables * num_buckets
+            # active_buckets: [Total_Buckets]
+            active_buckets = torch.zeros(total_buckets, device=self.device, dtype=torch.bool)
+            
+            # Mark all buckets present in the query (flattened)
+            active_buckets.index_fill_(0, q_global.view(-1).long(), True)
+            
+            # 3. Check collisions for candidates
+            #    [N_c, Tables] -> Look up in [Total_Buckets] -> [N_c, Tables] bools
+            hits = active_buckets[c_global.long()]
+            
+            # 4. Sum hits across tables to get total collisions per candidate
+            collision_counts = hits.int().sum(dim=1)
             
             # --- TIE-BREAKING LOGIC (controlled via `self.mode`) ---
             

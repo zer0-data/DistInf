@@ -1,7 +1,6 @@
 bmrt.egg-info/
 .venv/
 uv.lock
-
+modal_entry.py
 __pycache__/
 hf_token
-modal_entry.py

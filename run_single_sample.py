@@ -20,10 +20,9 @@ def main(args):
     if args.method == 'lsh' or args.method == 'hybrid':
         print(f"  - LSH Mode: {args.lsh_mode}")
         print(f"  - LSH Config: num_bits={args.num_bits}, num_tables={args.num_tables}")
-    print(f"  - Budget: {args.budget}")
+    print(f"  - Compression Ratio: {args.compression_ratio}")
     print(f"  - Protection Divisor: {args.protection_divisor}")
     print(f"  - Block size: {args.block_size}")
-    print(f"  - Top-K: {args.top_k} (Legacy arg, now implicitly global budget)")
     print(f"  - Max new tokens: {args.max_new_tokens}")
     print("="*60)
 
@@ -36,6 +35,24 @@ def main(args):
         print(f"Failed to load dataset: {e}")
         return
 
+    # Parse dataset config to get context size (e.g., '16k' -> 16000)
+    split_size_str = args.dataset_config.lower().rstrip('k')
+    try:
+        split_size = int(split_size_str) * 1000
+    except ValueError:
+        print(f"Failed to parse dataset_config '{args.dataset_config}'. Expected format like '16k', '32k', etc.")
+        return
+
+    # Compute budget based on compression mode and ratio
+    if args.compression_mode == 'recursive':
+        # budget = ratio * context_size
+        budget = int(args.compression_ratio * split_size)
+    else:  # accumulate
+        # budget = (2 * ratio * block_size * split_size) / (block_size + split_size)
+        budget = int((2 * args.compression_ratio * args.block_size * split_size) / (args.block_size + split_size))
+
+    print(f"Computed budget: {budget} (ratio={args.compression_ratio}, split_size={split_size})")
+
     # Helper to build engine per-sample (so we can fully release memory afterwards)
     def build_engine():
         # print("\n--- Loading RecursiveCompressionEngine ---")
@@ -47,7 +64,7 @@ def main(args):
                 selector_mode=args.mode,
                 compression_mode=args.compression_mode,
                 backend=args.backend,
-                budget=args.budget,
+                budget=budget,
                 protection_divisor=args.protection_divisor,
                 block_size=args.block_size,
                 max_new_tokens=args.max_new_tokens,
@@ -139,7 +156,7 @@ def main(args):
             f"dataset={args.dataset_config}/{args.dataset_split} | method={args.method} | "
             f"lsh_mode={args.lsh_mode} | hybrid={args.hybrid_primary}+{args.hybrid_secondary}:{args.hybrid_ratio} | "
             f"backend={args.backend} | compression_mode={args.compression_mode} | "
-            f"sampling_config=budget:{args.budget},block_size:{args.block_size},top_k:{args.top_k} | "
+            f"sampling_config=compression_ratio:{args.compression_ratio},block_size:{args.block_size},budget:{budget} | "
             f"protection_divisor={args.protection_divisor} | "
             f"samples=start:{args.start_sample_index},n:{args.num_samples} | "
             f"correct={correct}/{total} | accuracy={accuracy:.2f}%\n"
@@ -159,7 +176,7 @@ if __name__ == '__main__':
     parser.add_argument('--mode', default='l2', choices=['l2', 'max_sim', 'mahalanobis', 'partitioned_centroid', 'none'], help='Tie-breaker mode for LSHSelector')
     parser.add_argument('--compression_mode', default='accumulate', choices=['accumulate', 'recursive'])
     parser.add_argument('--backend', default='eager', choices=['eager', 'flash'])
-    parser.add_argument('--budget', type=int, default=2048)
+    parser.add_argument('--compression_ratio', type=float, default=0.5, help='Ratio of tokens to retain (retain/total)')
     parser.add_argument('--protection_divisor', type=int, default=4)
     parser.add_argument('--block_size', type=int, default=4096)
     parser.add_argument('--max_new_tokens', type=int, default=100)
@@ -179,7 +196,6 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_split', default='qa1')
     parser.add_argument('--start_sample_index', type=int, default=0)
     parser.add_argument('--num_samples', type=int, default=100)
-    parser.add_argument('--top_k', type=int, default=0, help="Unused but kept for compatibility")
     parser.add_argument('--results_file', default='accuracies.txt', help='File to append accuracy results')
     
     args = parser.parse_args()

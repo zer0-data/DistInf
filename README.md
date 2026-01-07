@@ -125,3 +125,26 @@ result = engine(
 
 print(result['text'][0])
 ```
+
+## LongBench v2 Evaluation
+
+We provide an adapted inference script for running LongBench v2 evaluations using the BMRT engine.
+
+### Usage
+
+**1. Run Inference**
+
+```bash
+python tests/pred.py \
+    --model_path gradientai/Llama-3-8B-Instruct-Gradient-1048k \
+    --method exact \
+    --compression_ratio 0.5 \
+    --block_size 4096 \
+    --save_dir results
+```
+
+**2. Evaluate Results**
+
+The output format is compatible with the official evaluation script.
+
+*Note: The script processes samples sequentially and uses `tqdm` for progress tracking. The `compression_ratio` is automatically converted to a token budget based on sample length.*

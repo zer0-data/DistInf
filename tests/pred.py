@@ -1,6 +1,7 @@
 import os, csv, json
 import argparse
 import time
+import sys
 from tqdm import tqdm
 from datasets import load_dataset
 import re
@@ -8,6 +9,9 @@ from transformers import AutoTokenizer
 import torch
 import gc
 import sys
+# Ensure repository root is on sys.path so sibling package `bmrt` can be imported
+# when this file is executed as a script (sys.path[0] becomes the tests/ folder).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from bmrt import RecursiveCompressionEngine
 
 # Remove OpenAI/network related imports and globals
@@ -56,7 +60,7 @@ def main():
     # Hybrid args
     parser.add_argument('--hybrid_primary', default='exact')
     parser.add_argument('--hybrid_secondary', default='lsh')
-    parser.add_argument('--hybrid_ratio', type=float, default=0.75)
+    parser.add_argument('--hybrid_ratio', type=float, default=0.5)
 
     args = parser.parse_args()
 
@@ -132,7 +136,9 @@ def main():
         question = item['question']
 
         # Context Truncation
-        input_ids = tokenizer.encode(context, disallowed_special=())
+        # `disallowed_special` is not a supported kwarg for the tokenizer API here.
+        # Use `add_special_tokens=False` to avoid adding model-specific special tokens.
+        input_ids = tokenizer.encode(context, add_special_tokens=False)
         if len(input_ids) > args.context_max_len:
             input_ids = input_ids[:args.context_max_len//2] + input_ids[-args.context_max_len//2:]
             context = tokenizer.decode(input_ids)

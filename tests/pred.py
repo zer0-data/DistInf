@@ -7,10 +7,12 @@ import re
 import torch
 import gc
 import sys
+
+
 from bmrt import RecursiveCompressionEngine
 
 # Remove OpenAI/network related imports and globals
-# model_map and maxlen_map are replaced by direct args or simple logic if needed, 
+# model_map and maxlen_map is replaced by direct args or simple logic if needed, 
 # but we will keep the structure of loading dataset and extracting answer.
 
 def extract_answer(response):
@@ -34,25 +36,25 @@ def main():
     parser.add_argument("--num_samples", type=int, default=999999) # Default to all key it simple
     
     # BMRT specific args
-    parser.add_argument('--method', default='exact', choices=['exact', 'lsh', 'hybrid'])
+    parser.add_argument('--method', default='hybrid', choices=['exact', 'lsh', 'hybrid'])
     parser.add_argument('--lsh_mode', default='frequency_rank', choices=['frequency_rank', 'magicpig_baseline'])
-    parser.add_argument('--mode', default='l2', choices=['l2', 'max_sim', 'mahalanobis', 'partitioned_centroid', 'none'], help='Tie-breaker mode for LSHSelector')
+    parser.add_argument('--mode', default='partitioned_centroid', choices=['l2', 'max_sim', 'mahalanobis', 'partitioned_centroid', 'none'], help='Tie-breaker mode for LSHSelector')
     parser.add_argument('--compression_mode', default='accumulate', choices=['accumulate', 'recursive'])
     parser.add_argument('--backend', default='eager', choices=['eager', 'flash'])
-    parser.add_argument('--compression_ratio', type=float, default=0.5, help='Ratio of tokens to retain (retain/total)')
+    parser.add_argument('--compression_ratio', type=float, default=0.125, help='Ratio of tokens to retain (retain/total)')
     parser.add_argument('--protection_divisor', type=int, default=4)
     parser.add_argument('--block_size', type=int, default=4096)
     parser.add_argument('--max_new_tokens', type=int, default=64) # Adjusted valid default
     parser.add_argument('--stop_words', default='')
     
     # LSH args
-    parser.add_argument('--num_bits', type=int, default=6, help='Number of bits per LSH hash')
-    parser.add_argument('--num_tables', type=int, default=4, help='Number of LSH hash tables')
+    parser.add_argument('--num_bits', type=int, default=10, help='Number of bits per LSH hash')
+    parser.add_argument('--num_tables', type=int, default=8, help='Number of LSH hash tables')
     
     # Hybrid args
     parser.add_argument('--hybrid_primary', default='exact')
     parser.add_argument('--hybrid_secondary', default='lsh')
-    parser.add_argument('--hybrid_ratio', type=float, default=0.5)
+    parser.add_argument('--hybrid_ratio', type=float, default=0.75)
 
     args = parser.parse_args()
 
@@ -125,18 +127,12 @@ def main():
         question = item['question']
         
         # Budget Calculation
-        # split_size approximation (context length in characters / 4 approx tokens, but better to rely on actual length if possible, 
-        # run_single_sample used '16k' config. Here we have varying lengths. 
-        # Let's approximate token count or use character length logic from run_single_sample which seemed to depend on 'dataset_config'.
-        # Since LongBench has varying lengths, we should probably calculate budget based on the specific context length if possible, 
-        # or just dynamic. failed to parse dataset_config in run_single_sample leads to return.
-        # But here we want to adapt. run_single_sample: split_size = int(split_size_str) * 1000. 
-        # Ideally we want budget relative to current sample length. 
-        # Let's assume 1 token ~= 4 chars for estimation or just use the length field if accurate.
-        # item['length'] is available. Let's use it as current 'split_size' approx or context length.
-        
-        context_len = item['length'] # Provided by dataset
-        
+        try:
+            context_len = int(item['length']) # Provided by dataset, ensuring it's an integer
+        except ValueError:
+            print(f"Warning: item['length'] is not a valid integer: {item['length']}. Defaulting to 8192 tokens for context_len.")
+            context_len = 131072 # Default to a large value for 'long' contexts
+            
         # Logic from run_single_sample.py
         if args.compression_mode == 'recursive':
              budget = int(args.compression_ratio * context_len)
@@ -157,7 +153,7 @@ def main():
             # Prepare prompt
             # Original pred.py logic for prompt construction:
             # prompt = template.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip())...
-            # We should follow how run_single_sample does it: prompt_context=context, prompt_query=query
+            # We should follow how run_single_sample does it: prompt_context, prompt_query
             # Wait, pred.py constructs a specific prompt with choices. 
             # run_single_sample takes query and context separate.
             # We need to format the query part to include choices as pred.py does.

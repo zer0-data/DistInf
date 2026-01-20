@@ -34,12 +34,16 @@ def main(args):
     print(f"\n--- 2. Loading Model {args.model_path} ---")
     try:
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        # Use a specific device and enable Flash Attention via model_kwargs
+        device = "cuda:0"
+        model_kwargs = {"attn_implementation": "flash_attention_2"}
         pipe = pipeline(
             "kv-press-text-generation",
             model=args.model_path,
-            device_map="auto",
+            device=device,
+            model_kwargs=model_kwargs,
             torch_dtype="auto",
-            trust_remote_code=True
+            trust_remote_code=True,
         )
         press = SnapKVPress(compression_ratio=args.compression_ratio)
         print("Model and SnapKV pipeline loaded successfully.")
@@ -151,9 +155,9 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model_path', default='meta-llama/Llama-3.1-8B-Instruct')
-    parser.add_argument('--dataset_config', default='16k')
-    parser.add_argument('--dataset_split', default='qa1')
+    parser.add_argument('--model_path', default='gradientai/Llama-3-8B-Instruct-Gradient-1048k')
+    parser.add_argument('--dataset_config', default='128k')
+    parser.add_argument('--dataset_split', default='qa2')
     parser.add_argument('--start_sample_index', type=int, default=0)
     parser.add_argument('--num_samples', type=int, default=100)
     parser.add_argument('--compression_ratio', type=float, default=0.125)
